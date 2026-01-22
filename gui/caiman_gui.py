@@ -18,9 +18,9 @@ import cv2
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph import FileDialog
-from pyqtgraph.Qt import QtGui, QtCore
+from pyqtgraph.Qt import QtGui, QtCore, QtWidgets
 from pyqtgraph.parametertree import Parameter, ParameterTree
-from scipy.ndimage.measurements import center_of_mass
+from scipy.ndimage import center_of_mass
 from scipy import sparse
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -28,17 +28,24 @@ import matplotlib.colors as mcolors
 from caiman.source_extraction.cnmf.cnmf import load_CNMF
 from caiman.source_extraction.cnmf.deconvolution import constrained_foopsi
 
-from memap_player import memap_window
+from .memap_player import memap_window
+from .caiman_runner import caiman_runner_window
 
 ## Interpret image data as 'col-major' (default pyqtgraph) or 'row-major' (numpy array)
 pg.setConfigOptions(imageAxisOrder='row-major')
 
-# %% Create a subclass MainWindow from the parent class QtGui.QMainWindow
-class MainWindow(QtGui.QMainWindow):
+# %% Create a subclass MainWindow from the parent class QtWidgets.QMainWindow
+class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, datapath=None, jsonpath=None):
         super(MainWindow, self).__init__()  # Inherit the constructor, methods and properties of the parent class
         self.resize(1400,1000)  # width, height
         self.setWindowTitle('Caiman GUI Lite for 1-photon data')
+        
+        # Set window icon
+        icon_path = os.path.join(os.path.dirname(__file__), '..', 'images', 'Caiman_logo_2.png')
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QtGui.QIcon(icon_path))
+        
         self.statusBar().showMessage('Ready')
         
         ## Discrete colors (cycle of 12) for displaying selected cells
@@ -59,8 +66,8 @@ class MainWindow(QtGui.QMainWindow):
         self.yx = np.array([-1,-1])  # Mosue clicked position [y,x] coordinates
         
         ## ------------ Central Widget Layout --------------------------------
-        cw = QtGui.QWidget()  # Create a central widget to hold everything
-        self.layout = QtGui.QGridLayout()  # Create and store the grid layout
+        cw = QtWidgets.QWidget()  # Create a central widget to hold everything
+        self.layout = QtWidgets.QGridLayout()  # Create and store the grid layout
         cw.setLayout(self.layout)
         self.setCentralWidget(cw)  
         
@@ -116,13 +123,18 @@ class MainWindow(QtGui.QMainWindow):
             self.fname_json = jsonpath
             self.load_json(click=False)
         ## ------------ Link mouse event -------------------------------------
-        # self.p1.mousePressEvent = self.mouse_clicked
+        self.p1.mousePressEvent = self.mouse_clicked
         ##  A general rule in Qt is that if you override one mouse event handler, you must override all of them ??
         # self.p1.mouseReleaseEvent = lambda *args: None  # "do nothing" function
         # self.p1.mouseMoveEvent = lambda *args: None
         self.p1.scene().sigMouseClicked.connect(self.mouse_clicked)
     
     def make_menu(self):
+        ## Run CaImAn processing
+        runCaiman = QtGui.QAction('Run CaImAn...', self)
+        runCaiman.setShortcut('Ctrl+R')
+        runCaiman.setStatusTip('Run CaImAn processing pipeline on raw image files...')
+        runCaiman.triggered.connect(lambda: caiman_runner_window(self))
         ## Load caiman hdf5 data
         openHDF5 = QtGui.QAction('Open...', self)
         openHDF5.setShortcut('Ctrl+O')
@@ -148,79 +160,97 @@ class MainWindow(QtGui.QMainWindow):
         viewMemap.setShortcut('Ctrl+M')
         viewMemap.setStatusTip('Display movie from mmap file...')
         viewMemap.triggered.connect(lambda: memap_window(self))
+        ## Exit application
+        exitAction = QtGui.QAction('Exit', self)
+        exitAction.setShortcut('Ctrl+W')
+        exitAction.setStatusTip('Exit application')
+        exitAction.triggered.connect(self.close)
         ## Make main menu
         menu = self.menuBar()
         file_menu = menu.addMenu('&File')
+        file_menu.addAction(runCaiman)
+        file_menu.addSeparator()
         file_menu.addAction(openHDF5)
         file_menu.addAction(loadJSON)
+        file_menu.addSeparator()
         file_menu.addAction(saveData)
         file_menu.addAction(saveAs)
+        file_menu.addSeparator()
+        file_menu.addAction(exitAction)
         view_menu = menu.addMenu('&View')
         view_menu.addAction(viewMemap)
         
     def make_parameter_tree(self):
-        param1 = [
-            {'name':'NWB config', 'type':'group','children':[
-                {'name':'Sess desc', 'type':'str'},
-                {'name':'Sess start t', 'type':'str'},
-                {'name':'Experimenter', 'type':'str'},
-                {'name':'Exp desc', 'type':'str'}]},
-            {'name':'RESET', 'type':'action'},
-            {'name':'NEURONS', 'type':'action'},
-            {'name':'CORRELATION', 'type':'action'},
-            {'name':'Image', 'type':'list', 'values':['Corr','PNR','Max','Mean','Std'], 'value':'PNR'},
-            {'name':'Metric', 'type':'list', 'values':['Rval','SNR','Mean paircorr','Max paircorr'], 'value':'Rval'},
-            {'name':'Trace', 'type':'list', 'values':['Raw','Denoised','Spike'], 'value':'Raw'},
-            {'name':'ACCEPTED', 'type':'action'},
-            {'name':'NEIGHBORS', 'type':'action'},
-            {'name':'Contour thr', 'type':'float', 'value':0.2, 'limits':(0,1), 'step':0.01},
-            {'name':'Contour pix', 'type':'int', 'value':1, 'limits':(1,6), 'step':1},
-            {'name':'Dist pix', 'type':'int', 'value':100, 'limits':(0,1000), 'step':5},
-            {'name':'Cell ID', 'type':'int', 'value':-1, 'limits':(-1,1000), 'step':1}
-        ]
-        self.par1 = Parameter.create(name='Parameters Display', type='group', children=param1)
-        self.t1.setParameters(self.par1, showTop=True)
-        self.par1.child('NWB config').sigTreeStateChanged.connect(self.change_config)
-        self.par1.param('RESET').sigActivated.connect(self.reset_button)
-        self.par1.param('NEURONS').sigActivated.connect(self.neurons_button)
-        self.par1.param('CORRELATION').sigActivated.connect(self.correlation_button)
-        self.par1.param('Image').sigValueChanged.connect(self.change_image)
-        self.par1.param('Metric').sigValueChanged.connect(self.change_metric)
-        self.par1.param('Trace').sigValueChanged.connect(self.draw_trace)
-        self.par1.param('ACCEPTED').sigActivated.connect(self.accepted_button)
-        self.par1.param('NEIGHBORS').sigActivated.connect(self.neighbors_button)
-        self.par1.param('Contour thr').sigValueChanged.connect(self.draw_fov_overall)
-        self.par1.param('Contour pix').sigValueChanged.connect(self.draw_fov_overall)
-        self.par1.param('Dist pix').sigValueChanged.connect(self.draw_fov_overall)
-        self.par1.param('Cell ID').sigValueChanged.connect(self.change_cell)
+        # Setup parameter tree t1 (only if not already set up)
+        if not hasattr(self, 'par1') or self.par1 is None:
+            param1 = [
+                {'name':'NWB config', 'type':'group','children':[
+                    {'name':'Sess desc', 'type':'str'},
+                    {'name':'Sess start t', 'type':'str'},
+                    {'name':'Experimenter', 'type':'str'},
+                    {'name':'Exp desc', 'type':'str'}]},
+                {'name':'RESET', 'type':'action'},
+                {'name':'NEURONS', 'type':'action'},
+                {'name':'CORRELATION', 'type':'action'},
+                {'name':'Image', 'type':'list', 'values':['Corr','PNR','Max','Mean','Std'], 'value':'PNR'},
+                {'name':'Metric', 'type':'list', 'values':['Rval','SNR','Mean paircorr','Max paircorr'], 'value':'Rval'},
+                {'name':'Trace', 'type':'list', 'values':['Raw','Denoised','Spike'], 'value':'Raw'},
+                {'name':'ACCEPTED', 'type':'action'},
+                {'name':'NEIGHBORS', 'type':'action'},
+                {'name':'Contour thr', 'type':'float', 'value':0.2, 'limits':(0,1), 'step':0.01},
+                {'name':'Contour pix', 'type':'int', 'value':1, 'limits':(1,6), 'step':1},
+                {'name':'Dist pix', 'type':'int', 'value':100, 'limits':(0,1000), 'step':5},
+                {'name':'Cell ID', 'type':'int', 'value':-1, 'limits':(-1,1000), 'step':1}
+            ]
+            self.par1 = Parameter.create(name='Parameters Display', type='group', children=param1)
+            # Clear tree first to prevent duplicates
+            self.t1.clear()
+            self.t1.setParameters(self.par1, showTop=True)
+            self.par1.child('NWB config').sigTreeStateChanged.connect(self.change_config)
+            self.par1.param('RESET').sigActivated.connect(self.reset_button)
+            self.par1.param('NEURONS').sigActivated.connect(self.neurons_button)
+            self.par1.param('CORRELATION').sigActivated.connect(self.correlation_button)
+            self.par1.param('Image').sigValueChanged.connect(self.change_image)
+            self.par1.param('Metric').sigValueChanged.connect(self.change_metric)
+            self.par1.param('Trace').sigValueChanged.connect(self.draw_trace)
+            self.par1.param('ACCEPTED').sigActivated.connect(self.accepted_button)
+            self.par1.param('NEIGHBORS').sigActivated.connect(self.neighbors_button)
+            self.par1.param('Contour thr').sigValueChanged.connect(self.draw_fov_overall)
+            self.par1.param('Contour pix').sigValueChanged.connect(self.draw_fov_overall)
+            self.par1.param('Dist pix').sigValueChanged.connect(self.draw_fov_overall)
+            self.par1.param('Cell ID').sigValueChanged.connect(self.change_cell)
         
-        param2 = [
-            {'name':'View components', 'type':'list', 'values':['All','Accepted','Rejected','Unassigned'], 'value':'All'},
-            {'name':'Filter components', 'type':'bool', 'value':True, 'tip':'Filter components'},          
-            {'name':'Quality thr','type':'group','children':[
-                {'name':'Rval high', 'type':'float', 'value':0.85, 'limits':(-1,1), 'step':0.01},
-                {'name':'Rval low', 'type':'float', 'value':-1, 'limits':(-1,1), 'step':0.01},
-                {'name':'SNR high', 'type':'float', 'value':2, 'limits':(0,20), 'step':0.1},
-                {'name':'SNR low', 'type':'float', 'value':0, 'limits':(0,20), 'step':0.1},
-                {'name':'CNN high', 'type':'float', 'value':0.99, 'limits':(0,1), 'step':0.01},
-                {'name':'CNN low', 'type':'float', 'value':0.1, 'limits':(0,1), 'step':0.01}]},
-            {'name':'ADD GROUP', 'type':'action'},
-            {'name':'REMOVE GROUP', 'type':'action'},
-            {'name':'MERGE', 'type':'action'},
-            {'name':'ADD SELECTED', 'type':'action'},
-            {'name':'REMOVE SELECTED', 'type':'action'},
-            {'name':'Info', 'type':'text'}
-        ]
-        self.par2 = Parameter.create(name='Parameters Action', type='group', children=param2)
-        self.t2.setParameters(self.par2, showTop=True)
-        self.par2.param('View components').sigValueChanged.connect(self.change_list)
-        self.par2.param('Filter components').sigValueChanged.connect(self.change_list)
-        self.par2.child('Quality thr').sigTreeStateChanged.connect(self.change_list)
-        self.par2.param('MERGE').sigActivated.connect(self.merge_components)
-        self.par2.param('ADD GROUP').sigActivated.connect(self.add_group)
-        self.par2.param('REMOVE GROUP').sigActivated.connect(self.remove_group)
-        self.par2.param('ADD SELECTED').sigActivated.connect(self.add_selected)
-        self.par2.param('REMOVE SELECTED').sigActivated.connect(self.remove_selected)
+        # Setup parameter tree t2 (only if not already set up)
+        if not hasattr(self, 'par2') or self.par2 is None:
+            param2 = [
+                {'name':'View components', 'type':'list', 'values':['All','Accepted','Rejected','Unassigned'], 'value':'All'},
+                {'name':'Filter components', 'type':'bool', 'value':True, 'tip':'Filter components'},          
+                {'name':'Quality thr','type':'group','children':[
+                    {'name':'Rval high', 'type':'float', 'value':0.85, 'limits':(-1,1), 'step':0.01},
+                    {'name':'Rval low', 'type':'float', 'value':-1, 'limits':(-1,1), 'step':0.01},
+                    {'name':'SNR high', 'type':'float', 'value':2, 'limits':(0,20), 'step':0.1},
+                    {'name':'SNR low', 'type':'float', 'value':0, 'limits':(0,20), 'step':0.1},
+                    {'name':'CNN high', 'type':'float', 'value':0.99, 'limits':(0,1), 'step':0.01},
+                    {'name':'CNN low', 'type':'float', 'value':0.1, 'limits':(0,1), 'step':0.01}]},
+                {'name':'ADD GROUP', 'type':'action'},
+                {'name':'REMOVE GROUP', 'type':'action'},
+                {'name':'MERGE', 'type':'action'},
+                {'name':'ADD SELECTED', 'type':'action'},
+                {'name':'REMOVE SELECTED', 'type':'action'},
+                {'name':'Info', 'type':'text'}
+            ]
+            self.par2 = Parameter.create(name='Parameters Action', type='group', children=param2)
+            # Clear tree first to prevent duplicates
+            self.t2.clear()
+            self.t2.setParameters(self.par2, showTop=True)
+            self.par2.param('View components').sigValueChanged.connect(self.change_list)
+            self.par2.param('Filter components').sigValueChanged.connect(self.change_list)
+            self.par2.child('Quality thr').sigTreeStateChanged.connect(self.change_list)
+            self.par2.param('MERGE').sigActivated.connect(self.merge_components)
+            self.par2.param('ADD GROUP').sigActivated.connect(self.add_group)
+            self.par2.param('REMOVE GROUP').sigActivated.connect(self.remove_group)
+            self.par2.param('ADD SELECTED').sigActivated.connect(self.add_selected)
+            self.par2.param('REMOVE SELECTED').sigActivated.connect(self.remove_selected)
         
     def load_data(self, click=True):
         self.loaded = False
@@ -636,14 +666,28 @@ class MainWindow(QtGui.QMainWindow):
         '''
         if self.mode in {'neurons', 'correlation'}:
             dims = self.cnmf.estimates.dims
-            # pos = self.img1.mapFromScene(event.pos())  # event from self.p1.mousePressEvent -> override all mouse press event
-            pos = self.img1.mapFromScene(event.scenePos())  # event from self.p1.scene().sigMouseClicked -> preserve other mouse utilities e.g. drag to span... 
+            # Handle both QMouseEvent (from mousePressEvent) and scene mouse events
+            if hasattr(event, 'scenePos'):
+                # Event from sigMouseClicked - has scenePos()
+                scene_pos = event.scenePos()
+            else:
+                # Event from mousePressEvent - need to map to scene coordinates
+                # Use position() instead of deprecated pos()
+                if hasattr(event, 'position'):
+                    widget_pos = event.position()
+                else:
+                    widget_pos = event.pos()  # Fallback for older PyQt versions
+                scene_pos = self.p1.mapToScene(widget_pos.toPoint() if hasattr(widget_pos, 'toPoint') else widget_pos)
+            pos = self.img1.mapFromScene(scene_pos)
             x, y = pos.x(), pos.y()
             if x>=0 and x<=dims[1] and y>=0 and y<=dims[0]:  # Do nothing if user clicks outside the image
                 # i = int(np.clip(y, 0, dims[0] - 1))  # Value outside the interval are clipped to the edges
                 # j = int(np.clip(x, 0, dims[1] - 1))
                 self.yx = np.array([y, x])
                 idx_components = self.cnmf.estimates.idx_components
+                # Check if there are any components before calculating distances
+                if len(idx_components) == 0:
+                    return  # No components to select
                 distances = np.sum((self.yx - self.cms[idx_components])**2, axis=1)  # **0.5
                 this_cell = idx_components[np.argmin(distances)]  # components_to_plot
                 self.update_selection(this_cell)
@@ -719,6 +763,9 @@ class MainWindow(QtGui.QMainWindow):
     def merge_components(self):
         '''Merge components in the selected_cells list and update cnmf object.
         '''
+        if not self.loaded:
+            self.statusBar().showMessage('Please load a data file first')
+            return
         if len(self.selected_cells) > 1:
             K = self.cnmf.estimates.C.shape[0]
             K1 = K - len(self.selected_cells) + 1  # Number of total components after merge
@@ -764,6 +811,9 @@ class MainWindow(QtGui.QMainWindow):
     def add_group(self):
         '''Add all current components to the accepted list
         '''
+        if not self.loaded:
+            self.statusBar().showMessage('Please load a data file first')
+            return
         self.cnmf.estimates.accepted_list = \
             np.union1d(self.cnmf.estimates.accepted_list, self.cnmf.estimates.idx_components)  # union of two arrays
         self.cnmf.estimates.rejected_list = \
@@ -773,6 +823,9 @@ class MainWindow(QtGui.QMainWindow):
     def remove_group(self):
         '''Remove all current components from the accepted list and put them into the rejected list
         '''
+        if not self.loaded:
+            self.statusBar().showMessage('Please load a data file first')
+            return
         self.cnmf.estimates.rejected_list = \
             np.union1d(self.cnmf.estimates.rejected_list, self.cnmf.estimates.idx_components)
         self.cnmf.estimates.accepted_list = \
@@ -782,6 +835,9 @@ class MainWindow(QtGui.QMainWindow):
     def add_selected(self):
         '''Add the current selected component to the accepted list
         '''
+        if not self.loaded:
+            self.statusBar().showMessage('Please load a data file first')
+            return
         self.cnmf.estimates.accepted_list = \
             np.union1d(self.cnmf.estimates.accepted_list, self.selected_cells)
         self.cnmf.estimates.rejected_list = \
@@ -793,6 +849,9 @@ class MainWindow(QtGui.QMainWindow):
     def remove_selected(self):
         '''Remove the current selected component from the accepted list and put it into the rejected list
         '''
+        if not self.loaded:
+            self.statusBar().showMessage('Please load a data file first')
+            return
         self.cnmf.estimates.rejected_list = \
             np.union1d(self.cnmf.estimates.rejected_list, self.selected_cells)
         self.cnmf.estimates.accepted_list = \
@@ -1009,12 +1068,19 @@ def update_list(K, list_idx, merge_idx):
     return list_merged
     
 # %% Execute application event loop
-if __name__ == '__main__':
+def main():
+    """Main entry point for the CaImAn GUI application."""
     ## Initializing Qt
-    app = QtGui.QApplication(sys.argv)
+    app = QtWidgets.QApplication(sys.argv)
+    # Fix for double text in parametertree action buttons (issue #2380)
+    # Set style to Fusion to prevent duplicate text on action buttons
+    app.setStyle("Fusion")
     ## Instantiate the MainWindow class
     win = MainWindow()
     # win = MainWindow(jsonpath='config_nwb.json')
     # win = MainWindow(datapath=r'D:\Miniscope\2019-11-20-11-55-39_video1_memmap__d1_714_d2_728_d3_1_order_C_frames_6130_.hdf5')
     win.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
+
+if __name__ == '__main__':
+    main()

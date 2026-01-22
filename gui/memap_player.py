@@ -11,19 +11,18 @@ import sys
 import numpy as np
 import cv2
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtGui, QtCore
-from PyQt5.QtWidgets import QFileDialog
+from pyqtgraph.Qt import QtGui, QtCore, QtWidgets
 
 pg.setConfigOptions(imageAxisOrder='row-major')
 
 # %%
-class MemapPlayer(QtGui.QMainWindow):
+class MemapPlayer(QtWidgets.QMainWindow):
     def __init__(self, parent=None):
         super(MemapPlayer, self).__init__(parent)
         self.resize(800,800)  # width, height
         self.setWindowTitle('View registered frames')
-        self.layout = QtGui.QGridLayout()
-        cw = QtGui.QWidget()
+        self.layout = QtWidgets.QGridLayout()
+        cw = QtWidgets.QWidget()
         cw.setLayout(self.layout)
         self.setCentralWidget(cw)
         ## -------- Some internal variables/parameters -----------------------
@@ -37,54 +36,54 @@ class MemapPlayer(QtGui.QMainWindow):
         self.dframe = 10  # Number of frames to jump using left/right keys
         self.this_cell = -1
         ## -------- Button to open memap file --------------------------------
-        openButton = QtGui.QPushButton('OPEN')
-        self.fileLabel = QtGui.QLabel('No file chosen')
+        openButton = QtWidgets.QPushButton('OPEN')
+        self.fileLabel = QtWidgets.QLabel('No file chosen')
         self.layout.addWidget(openButton,0,0,1,2)  # i-row, j-col, nrow, ncol
         self.layout.addWidget(self.fileLabel,0,2,1,14)
         openButton.clicked.connect(self.open_memap)
         ## -------- Parameters -----------------------------------------------
-        rateLabel = QtGui.QLabel('Frame rate:')
+        rateLabel = QtWidgets.QLabel('Frame rate:')
         self.layout.addWidget(rateLabel,1,2,1,1)
-        self.rate = QtGui.QLineEdit()
+        self.rate = QtWidgets.QLineEdit()
         self.rate.setFixedWidth(50)
         self.rate.setAlignment(QtCore.Qt.AlignCenter)  # AlignRight
         self.rate.setText(str(self.fps))
         self.rate.textChanged.connect(self.change_params)
         self.layout.addWidget(self.rate,1,3,1,1)
-        self.layout.addItem(QtGui.QSpacerItem(10,20),1,4,1,1)  # Horizontal spacer
-        binLabel = QtGui.QLabel('Frame binning:')
+        self.layout.addItem(QtWidgets.QSpacerItem(10,20),1,4,1,1)  # Horizontal spacer
+        binLabel = QtWidgets.QLabel('Frame binning:')
         self.layout.addWidget(binLabel,1,5,1,1)
-        self.binning = QtGui.QLineEdit()
+        self.binning = QtWidgets.QLineEdit()
         self.binning.setValidator(QtGui.QIntValidator(1,100))
         self.binning.setFixedWidth(30)
         self.binning.setAlignment(QtCore.Qt.AlignCenter)  # AlignRight
         self.binning.setText(str(self.dt))
         self.binning.textChanged.connect(self.change_params)
         self.layout.addWidget(self.binning,1,6,1,1)
-        self.layout.addItem(QtGui.QSpacerItem(10,20),1,7,1,1)  # Horizontal spacer
-        sigmaLabel = QtGui.QLabel('Highpass gSig:')  # QtGui.QCheckBox('Highpass')
+        self.layout.addItem(QtWidgets.QSpacerItem(10,20),1,7,1,1)  # Horizontal spacer
+        sigmaLabel = QtWidgets.QLabel('Highpass gSig:')  # QtWidgets.QCheckBox('Highpass')
         self.layout.addWidget(sigmaLabel,1,8,1,1)
-        self.highpass = QtGui.QLineEdit()
+        self.highpass = QtWidgets.QLineEdit()
         self.highpass.setValidator(QtGui.QIntValidator(0,50))
         self.highpass.setFixedWidth(30)
         self.highpass.setAlignment(QtCore.Qt.AlignCenter)  # AlignRight
         self.highpass.setText(str(self.sigma))
         self.highpass.textChanged.connect(self.change_params)
         self.layout.addWidget(self.highpass,1,9,1,1)
-        self.layout.addItem(QtGui.QSpacerItem(10,20),1,10,1,1)  # Horizontal spacer
-        medianLabel = QtGui.QLabel('Median filt:')
+        self.layout.addItem(QtWidgets.QSpacerItem(10,20),1,10,1,1)  # Horizontal spacer
+        medianLabel = QtWidgets.QLabel('Median filt:')
         self.layout.addWidget(medianLabel,1,11,1,1)
-        self.medfilt = QtGui.QLineEdit()
+        self.medfilt = QtWidgets.QLineEdit()
         self.medfilt.setValidator(QtGui.QIntValidator(0,50))
         self.medfilt.setFixedWidth(30)
         self.medfilt.setAlignment(QtCore.Qt.AlignCenter)  # AlignRight
         self.medfilt.setText(str(self.medSize))
         self.medfilt.textChanged.connect(self.change_params)
         self.layout.addWidget(self.medfilt,1,12,1,1)
-        self.layout.addItem(QtGui.QSpacerItem(10,20),1,13,1,1)  # Horizontal spacer
-        cellLabel = QtGui.QLabel('Component:')
+        self.layout.addItem(QtWidgets.QSpacerItem(10,20),1,13,1,1)  # Horizontal spacer
+        cellLabel = QtWidgets.QLabel('Component:')
         self.layout.addWidget(cellLabel,1,14,1,1)
-        self.component = QtGui.QLineEdit()
+        self.component = QtWidgets.QLineEdit()
         self.component.setValidator(QtGui.QIntValidator(-1,1000))
         self.component.setFixedWidth(40)
         self.component.setAlignment(QtCore.Qt.AlignCenter)  # AlignRight
@@ -119,25 +118,25 @@ class MemapPlayer(QtGui.QMainWindow):
             
         ## -------- Button play/pauss and slider -----------------------------
         iconSize = QtCore.QSize(24,24)
-        self.playButton = QtGui.QToolButton()
-        self.playButton.setIcon(self.style().standardIcon(QtGui.QStyle.SP_MediaPlay))
+        self.playButton = QtWidgets.QToolButton()
+        self.playButton.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay))
         self.playButton.setIconSize(iconSize)
         self.playButton.setToolTip('Play')
         self.playButton.setCheckable(True)
         self.playButton.setEnabled(False)
-        self.pauseButton = QtGui.QToolButton()
-        self.pauseButton.setIcon(self.style().standardIcon(QtGui.QStyle.SP_MediaPause))
+        self.pauseButton = QtWidgets.QToolButton()
+        self.pauseButton.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaPause))
         self.pauseButton.setIconSize(iconSize)
         self.pauseButton.setToolTip('Pause')
         self.pauseButton.setCheckable(True)
         self.pauseButton.setEnabled(False)
-        self.frameSlider = QtGui.QSlider(QtCore.Qt.Horizontal)
+        self.frameSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.frameSlider.setTracking(False)
         self.layout.addWidget(self.playButton,3,0,1,1)
         self.layout.addWidget(self.pauseButton,3,1,1,1)
         self.layout.addWidget(self.frameSlider,3,2,1,14)
-        frameTitle = QtGui.QLabel('Elapsed time:')
-        self.elapsedTime = QtGui.QLabel('0:00.0')
+        frameTitle = QtWidgets.QLabel('Elapsed time:')
+        self.elapsedTime = QtWidgets.QLabel('0:00.0')
         self.layout.addWidget(frameTitle,4,0,1,2)
         self.layout.addWidget(self.elapsedTime,4,2,1,1)        
         self.playButton.clicked.connect(self.play)
@@ -149,7 +148,7 @@ class MemapPlayer(QtGui.QMainWindow):
     
     # %%
     def open_memap(self):
-        fmemap = QFileDialog.getOpenFileName(
+        fmemap = QtWidgets.QFileDialog.getOpenFileName(
             caption='Load memory-mapped file', filter='MMAP (*.mmap)')[0]
         try:
             Yr, dims, T = load_memmap(fmemap)  # Shape (N,T)
@@ -317,8 +316,8 @@ def memap_window(parent):
     
 # %% Execute MemapPlayer() as a standalone GUI
 if __name__ == '__main__':
-    app = QtGui.QApplication(sys.argv)
+    app = QtWidgets.QApplication(sys.argv)
     win = MemapPlayer()
     win.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
     
