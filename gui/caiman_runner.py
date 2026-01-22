@@ -277,7 +277,7 @@ class CaimanRunner(QtWidgets.QDialog):
                 {'name': 'Number of Processes', 'type': 'int', 'value': 8, 'limits': (1, 32)},
             ]},
             {'name': 'Motion Correction', 'type': 'group', 'children': [
-                {'name': 'gSig_filt', 'type': 'int', 'value': 7, 'limits': (1, 33)},
+                {'name': 'gSig_filt', 'type': 'int', 'value': 3, 'limits': (1, 33)},
                 {'name': 'max_shifts', 'type': 'int', 'value': 20},
             ]},
             {'name': 'CNMF-E Parameters', 'type': 'group', 'children': [
@@ -354,8 +354,6 @@ class CaimanRunner(QtWidgets.QDialog):
         has_selected = len(self.selected_files) > 0
         self.run_btn.setEnabled(has_selected)
         self.preview_btn.setEnabled(has_selected)
-        if has_selected:
-            self.log(f'{len(self.selected_files)} file(s) selected for processing')
     
     def _format_duration(self, duration):
         """Format duration in seconds to human-readable string."""
@@ -444,7 +442,7 @@ class CaimanRunner(QtWidgets.QDialog):
             # Pre-calculate F0 baseline for dF/F (20th percentile) - PER PIXEL
             # This calculates the 20th percentile along the time axis (axis=0),
             # resulting in a 2D array (H, W) where each pixel has its own F0 baseline
-            self.log('Calculating per-pixel baseline for dF/F...')
+            self.log('Calculating baseline for dF/F...')
             self.F0_baseline = np.percentile(self.video_frames, 20, axis=0)  # Shape: (H, W) - per pixel
             self.F0_baseline = np.maximum(self.F0_baseline, 1e-6)
             self.video_frames_dff = None  # Will be calculated on demand
@@ -452,10 +450,10 @@ class CaimanRunner(QtWidgets.QDialog):
             
             # Calculate overall video statistics for fixed normalization
             self.log('Calculating video statistics...')
-            self.video_min = np.percentile(self.video_frames, 1)  # 1st percentile to ignore outliers
-            self.video_max = np.percentile(self.video_frames, 99)  # 99th percentile to ignore outliers
-            self.dff_min = None  # Will be calculated when dF/F is computed
-            self.dff_max = None
+            self.video_min = np.percentile(self.video_frames, 1)
+            self.video_max = np.percentile(self.video_frames, 99.5)
+            self.dff_min = 0
+            self.dff_max = 100
             
             self.update_frame_display()
             self.log(f'Loaded {len(self.video_frames)} frames for preview')
@@ -513,13 +511,8 @@ class CaimanRunner(QtWidgets.QDialog):
                 # Pre-calculate all dF/F frames if not already done
                 # dF/F is calculated per-pixel: (F - F0) / F0 for each pixel independently
                 if self.video_frames_dff is None:
-                    self.log('Pre-calculating per-pixel dF/F for all frames...')
-                    # Broadcasting: (T, H, W) - (H, W) = (T, H, W) - each pixel normalized independently
-                    self.video_frames_dff = (self.video_frames - self.F0_baseline) / self.F0_baseline
-                    # Calculate dF/F statistics (using percentiles to ignore outliers)
-                    self.dff_min = np.percentile(self.video_frames_dff, 1)
-                    self.dff_max = np.percentile(self.video_frames_dff, 99)
-                    self.log('dF/F calculation complete')
+                    self.log('Pre-calculating dF/F...')
+                    self.video_frames_dff = 100 * (self.video_frames - self.F0_baseline) / self.F0_baseline # percent
                 
                 frame = self.video_frames_dff[self.current_frame_idx]
                 # Use fixed normalization range for dF/F
@@ -659,16 +652,13 @@ class CaimanRunner(QtWidgets.QDialog):
             # Create thresholded image: pixels below threshold are shown in red/black
             corr_mask = self.correlation_image < min_corr
             
-            # Normalize correlation image for display (0-1 range)
-            corr_min = np.min(self.correlation_image)
-            corr_max = np.max(self.correlation_image)
-            corr_range = corr_max - corr_min + 1e-10
-            corr_norm = (self.correlation_image - corr_min) / corr_range
+            # Clip correlation image to slider range [0, 1.0] and scale to 0-255
+            corr_max = 1.0  # Slider range is 0-100 representing 0.00-1.00
+            corr_clipped = np.clip(self.correlation_image, 0, corr_max)
+            corr_uint8 = (corr_clipped / corr_max * 255).astype(np.uint8)
             
             # Create RGB image: thresholded pixels in red, others in grayscale
-            # Convert to uint8 (0-255) for pyqtgraph compatibility
-            corr_display = np.zeros((*corr_norm.shape, 3), dtype=np.uint8)
-            corr_uint8 = (corr_norm * 255).astype(np.uint8)
+            corr_display = np.zeros((*corr_uint8.shape, 3), dtype=np.uint8)
             corr_display[:, :, 0] = corr_uint8  # Red channel
             corr_display[:, :, 1] = corr_uint8  # Green channel
             corr_display[:, :, 2] = corr_uint8  # Blue channel
@@ -688,16 +678,13 @@ class CaimanRunner(QtWidgets.QDialog):
             # Create thresholded image: pixels below threshold are shown in red/black
             pnr_mask = self.peak_to_noise_ratio < min_pnr
             
-            # Normalize PNR image for display
-            pnr_min = np.min(self.peak_to_noise_ratio)
-            pnr_max = np.max(self.peak_to_noise_ratio)
-            pnr_range = pnr_max - pnr_min + 1e-10
-            pnr_norm = (self.peak_to_noise_ratio - pnr_min) / pnr_range
+            # Clip PNR image to slider range [0, 20.0] and scale to 0-255
+            pnr_max = 20.0  # Slider range is 0-200 representing 0.0-20.0
+            pnr_clipped = np.clip(self.peak_to_noise_ratio, 0, pnr_max)
+            pnr_uint8 = (pnr_clipped / pnr_max * 255).astype(np.uint8)
             
             # Create RGB image: thresholded pixels in red, others in grayscale
-            # Convert to uint8 (0-255) for pyqtgraph compatibility
-            pnr_display = np.zeros((*pnr_norm.shape, 3), dtype=np.uint8)
-            pnr_uint8 = (pnr_norm * 255).astype(np.uint8)
+            pnr_display = np.zeros((*pnr_uint8.shape, 3), dtype=np.uint8)
             pnr_display[:, :, 0] = pnr_uint8  # Red channel
             pnr_display[:, :, 1] = pnr_uint8  # Green channel
             pnr_display[:, :, 2] = pnr_uint8  # Blue channel
@@ -722,7 +709,7 @@ class CaimanRunner(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, 'Error', 'Please select at least one file to preview')
             return
         
-        files = self.selected_files
+        files = natsorted(self.selected_files)
         
         self.preview_btn.setEnabled(False)
         self.log('\n' + '='*50)
@@ -869,11 +856,21 @@ class CaimanRunner(QtWidgets.QDialog):
             self.log(f'Total duration: {duration_str} ({total_duration:.2f} seconds)')
             self.log('='*50)
             
-            caiman_dir = self.data_path / 'caiman'
-            save_path = caiman_dir / f'{self.data_path.name}_data.hdf5'
+            # Get save path from save_results (stored as self.save_path)
+            save_path = self.save_path
             QtWidgets.QMessageBox.information(
                 self, 'Success', 
                 f'Processing completed!\nDuration: {duration_str}\n\nResults saved to:\n{save_path}')
+            
+            # Automatically load the saved file in the main GUI if parent is MainWindow
+            parent = self.parent()
+            if parent is not None and hasattr(parent, 'load_data'):
+                try:
+                    self.log(f'\nLoading saved file in main GUI: {save_path}')
+                    parent.load_data(click=False, filepath=str(save_path))
+                    self.log('File loaded successfully in main GUI')
+                except Exception as e:
+                    self.log(f'Warning: Could not auto-load file in main GUI: {str(e)}')
             
         except Exception as e:
             # Calculate and display duration even on error
@@ -942,7 +939,7 @@ class CaimanRunner(QtWidgets.QDialog):
         
         # Run motion correction
         mot_correct = MotionCorrect(
-            files[0], 
+            files, 
             dview=self.cluster, 
             **parameters.get_group('motion')
         )
@@ -951,7 +948,7 @@ class CaimanRunner(QtWidgets.QDialog):
         # Save memory-mapped file
         files_mc = cm.save_memmap(
             mot_correct.fname_tot_rig,
-            base_name='memmap_',
+            base_name=f'{self.data_path.name}_',
             order='C',
             border_to_0=0
         )
@@ -974,8 +971,9 @@ class CaimanRunner(QtWidgets.QDialog):
         
         # Calculate correlation and PNR images
         self.log('Calculating correlation and PNR images...')
+        images_part = images[:1000]
         correlation_image, peak_to_noise_ratio = cm.summary_images.correlation_pnr(
-            images, gSig=gSig, swap_dim=False
+            images_part, gSig=gSig, swap_dim=False
         )
         
         # Store correlation image for later use
@@ -984,6 +982,9 @@ class CaimanRunner(QtWidgets.QDialog):
         self.image_max = np.max(images, axis=0)
         self.image_mean = np.mean(images, axis=0)
         self.image_std = np.std(images, axis=0)
+        
+        # Update correlation and PNR plots
+        self.update_image_plots()
         
         # Get framerate for data params
         framerate = self.params.child('Data Parameters', 'Frame Rate (Hz)').value()
@@ -1074,6 +1075,7 @@ class CaimanRunner(QtWidgets.QDialog):
         caiman_dir.mkdir(exist_ok=True)
         
         save_path = caiman_dir / f'{self.data_path.name}_data.hdf5'
+        self.save_path = save_path  # Store for later use
         
         # Add correlation image if not available
         if not hasattr(self.cnmfe_model, 'cn_filter') or self.cnmfe_model.cn_filter is None:

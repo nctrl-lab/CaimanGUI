@@ -252,12 +252,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.par2.param('ADD SELECTED').sigActivated.connect(self.add_selected)
             self.par2.param('REMOVE SELECTED').sigActivated.connect(self.remove_selected)
         
-    def load_data(self, click=True):
+    def load_data(self, click=True, filepath=None):
         self.loaded = False
-        if click:
+        if filepath is not None:
+            # Load from provided file path
+            self.fname = filepath
+        elif click:
             fname = FileDialog().getOpenFileName(
                 caption='Load CNMF Object', filter='HDF5 (*.h5 *.hdf5)')[0]  # ;;NWB (*.nwb)
             self.fname = fname
+        
+        if not hasattr(self, 'fname') or self.fname is None or self.fname == '':
+            self.statusBar().showMessage('No file specified for loading')
+            return
+            
         try:
             self.cnmf = load_CNMF(self.fname)
             self.loaded = True
