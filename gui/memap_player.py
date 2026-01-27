@@ -37,6 +37,7 @@ class MemapPlayer(QtWidgets.QMainWindow):
         self.this_cell = -1
         ## -------- Button to open memap file --------------------------------
         openButton = QtWidgets.QPushButton('OPEN')
+        openButton.setShortcut(QtGui.QKeySequence("Ctrl+O"))
         self.fileLabel = QtWidgets.QLabel('No file chosen')
         self.layout.addWidget(openButton,0,0,1,2)  # i-row, j-col, nrow, ncol
         self.layout.addWidget(self.fileLabel,0,2,1,14)
@@ -148,8 +149,9 @@ class MemapPlayer(QtWidgets.QMainWindow):
     
     # %%
     def open_memap(self):
+        fd = os.path.expanduser('~/caiman_data/temp')
         fmemap = QtWidgets.QFileDialog.getOpenFileName(
-            caption='Load memory-mapped file', filter='MMAP (*.mmap)')[0]
+            caption='Load memory-mapped file', filter='MMAP (*.mmap)', dir=fd)[0]
         try:
             Yr, dims, T = load_memmap(fmemap)  # Shape (N,T)
             self.movie = Yr.T.reshape((T,)+dims, order='F')  # Shape (T,y,x)
@@ -292,8 +294,8 @@ def load_memmap(fname, dtype='float32', key=None):
     T: int
         Number of frames
     '''
-    filename = os.path.split(fname)[-1]
-    fpart = filename.split('_')[1:-1]  # The filename encodes the structure of the map
+    filename = os.path.splitext(os.path.split(fname)[-1])[0]
+    fpart = filename.split('_')
     d1, d2, d3, T, order = int(fpart[-9]), int(fpart[-7]), int(fpart[-5]), int(fpart[-1]), fpart[-3]
     dims = (d1,d2) if d3==1 else (d1,d2,d3)
     shape_mov = (np.uint64(np.prod(dims)), np.uint64(T))
