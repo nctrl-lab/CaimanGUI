@@ -14,6 +14,9 @@ of different groups ('All', 'Accepted', 'Rejected', 'Unassigned') under various 
 import os
 import sys
 import json
+import logging
+import datetime
+from pathlib import Path
 import cv2
 import numpy as np
 import pyqtgraph as pg
@@ -31,17 +34,15 @@ from caiman.source_extraction.cnmf.deconvolution import constrained_foopsi
 from .memap_player import memap_window
 from .caiman_runner import caiman_runner_window
 
-## Interpret image data as 'col-major' (default pyqtgraph) or 'row-major' (numpy array)
 pg.setConfigOptions(imageAxisOrder='row-major')
 
-# %% Create a subclass MainWindow from the parent class QtWidgets.QMainWindow
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, datapath=None, jsonpath=None):
-        super(MainWindow, self).__init__()  # Inherit the constructor, methods and properties of the parent class
-        self.resize(1400,1000)  # width, height
+        super(MainWindow, self).__init__()
+        self.resize(1400,1000)
         self.setWindowTitle('Caiman GUI Lite for 1-photon data')
         
-        # Set window icon
+        # Icon
         icon_path = os.path.join(os.path.dirname(__file__), '..', 'images', 'Caiman_logo_2.png')
         if os.path.exists(icon_path):
             self.setWindowIcon(QtGui.QIcon(icon_path))
@@ -64,6 +65,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.neighbor_cells = []  # List of neighbor cells (mode 'neighbors')
         self.last_cell = None  # The cell index of the previously selected cell (used in mode 'accepted'|'neighbors')
         self.yx = np.array([-1,-1])  # Mosue clicked position [y,x] coordinates
+        self.logger = None  # Logger instance for save folder
         
         ## ------------ Central Widget Layout --------------------------------
         cw = QtWidgets.QWidget()  # Create a central widget to hold everything
@@ -77,12 +79,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.p1 = pg.PlotWidget()  # For imaging FOV
         self.p2 = pg.PlotWidget()  # For other image (scatter plot...)
         self.p3 = pg.PlotWidget()  # For fluorescence traces
+        ## Neuron list table (Phy-like interface)
+        self.neuron_table = QtWidgets.QTableWidget()
+        self.neuron_table.setColumnCount(7)
+        self.neuron_table.setHorizontalHeaderLabels(['ID', 'Rval', 'SNR', 'CNN', 'Area', 'Quality', 'Status'])
+        self.neuron_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.neuron_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)  # Allow multiple selection with Ctrl/Shift
+        self.neuron_table.setSortingEnabled(True)
+        self.neuron_table.itemSelectionChanged.connect(self.on_table_selection_changed)
+        self.neuron_table.itemDoubleClicked.connect(self.on_table_double_clicked)
         ## Add widgets to the layout in their proper positions
         self.layout.addWidget(self.t1, 0, 0)  # top-left
         self.layout.addWidget(self.t2, 1, 0)  # bottom-left
         self.layout.addWidget(self.p1, 0, 1)  # top-middle
         self.layout.addWidget(self.p2, 0, 2)   # top-right
         self.layout.addWidget(self.p3, 1, 1, 1, 2)  # bottom-left, spanning 2 columns
+        self.layout.addWidget(self.neuron_table, 0, 3, 2, 1)  # right column, spanning 2 rows
         ## Set widget size
         self.t1.setMinimumHeight(320)
         self.t1.setMinimumWidth(270)
@@ -90,6 +102,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t2.setMinimumHeight(320)
         self.t2.setMinimumWidth(270)
         self.t2.setMaximumWidth(360)
+        self.neuron_table.setMinimumWidth(300)
+        self.neuron_table.setMaximumWidth(400)
         
         ## ------------ Create plot area (ViewBox + axes) --------------------
         self.img1 = pg.ImageItem()
@@ -223,15 +237,16 @@ class MainWindow(QtWidgets.QMainWindow):
         # Setup parameter tree t2 (only if not already set up)
         if not hasattr(self, 'par2') or self.par2 is None:
             param2 = [
-                {'name':'View components', 'type':'list', 'values':['All','Accepted','Rejected','Unassigned'], 'value':'All'},
+                {'name':'View components', 'type':'list', 'values':['All','Accepted','Rejected','Uncertain','Unassigned'], 'value':'All'},
                 {'name':'Filter components', 'type':'bool', 'value':True, 'tip':'Filter components'},          
                 {'name':'Quality thr','type':'group','children':[
                     {'name':'Rval high', 'type':'float', 'value':0.85, 'limits':(-1,1), 'step':0.01},
-                    {'name':'Rval low', 'type':'float', 'value':-1, 'limits':(-1,1), 'step':0.01},
+                    {'name':'Rval low', 'type':'float', 'value':0.0, 'limits':(-1,1), 'step':0.01},
                     {'name':'SNR high', 'type':'float', 'value':2, 'limits':(0,20), 'step':0.1},
                     {'name':'SNR low', 'type':'float', 'value':0, 'limits':(0,20), 'step':0.1},
-                    {'name':'CNN high', 'type':'float', 'value':0.99, 'limits':(0,1), 'step':0.01},
-                    {'name':'CNN low', 'type':'float', 'value':0.1, 'limits':(0,1), 'step':0.01}]},
+                    {'name':'CNN high', 'type':'float', 'value':0.90, 'limits':(0,1), 'step':0.01},
+                    {'name':'CNN low', 'type':'float', 'value':0.2, 'limits':(0,1), 'step':0.01},
+                    {'name':'Area low', 'type':'int', 'value':25, 'limits':(0,10000), 'step':1}]},
                 {'name':'ADD GROUP', 'type':'action'},
                 {'name':'REMOVE GROUP', 'type':'action'},
                 {'name':'MERGE', 'type':'action'},
@@ -292,16 +307,28 @@ class MainWindow(QtWidgets.QMainWindow):
             self.colorbar.setLabels({f'{rval.min():.2f}':0, f'{rval.max():.2f}':1})
             self.metric = (rval-rval.min())/(rval.max()-rval.min())
             
-            ## Build accepted and rejected list
+            ## Build accepted, rejected, and uncertain list
             accepted_empty = True
             if hasattr(self.cnmf.estimates, 'accepted_list'):
                 accepted_empty = (len(self.cnmf.estimates.accepted_list)==0)  # False if accepted_list already contains neuron indices 
             if accepted_empty:
                 self.cnmf.estimates.accepted_list = np.array([], dtype=int)
                 self.cnmf.estimates.rejected_list = np.array([], dtype=int)
+            if not hasattr(self.cnmf.estimates, 'uncertain_list'):
+                self.cnmf.estimates.uncertain_list = np.array([], dtype=int)
+            
+            # Setup logger at save folder location
+            if hasattr(self, 'fname') and self.fname:
+                save_folder = os.path.dirname(self.fname)
+                self.setup_logger(save_folder)
+                if self.logger:
+                    self.logger.info(f'Data loaded from: {self.fname}')
+            
             self.par2.param('View components').setValue('All', blockSignal=self.change_list)
             self.reset_button()
             self.print_info()
+            # Populate neuron table
+            self.populate_neuron_table()
             
             ## Set realistic limits
             max_dist = np.sqrt(np.sum(np.array(dims)**2))
@@ -423,12 +450,539 @@ class MainWindow(QtWidgets.QMainWindow):
         K = self.cnmf.estimates.C.shape[0]
         idx_components = self.cnmf.estimates.idx_components
         accepted_list = self.cnmf.estimates.accepted_list
+        rejected_list = self.cnmf.estimates.rejected_list
+        uncertain_list = getattr(self.cnmf.estimates, 'uncertain_list', np.array([], dtype=int))
         self.par2.param('Info').setValue(
             os.path.split(self.fname)[-1] + '\n' 
             + '-'*32 + '\n' 
             + f'Total components: {K}\n'
             + f'Current group: {len(idx_components)}\n'
-            + f'Accepted: {len(accepted_list)}\n')  # + str([*accepted_list])
+            + f'Accepted: {len(accepted_list)}\n'
+            + f'Rejected: {len(rejected_list)}\n'
+            + f'Uncertain: {len(uncertain_list)}\n')  # + str([*accepted_list])
+    
+    def populate_neuron_table(self):
+        """Populate the neuron table with all neurons and their parameters."""
+        if not self.loaded:
+            return
+        
+        K = self.cnmf.estimates.C.shape[0]
+        rval = self.cnmf.estimates.r_values
+        snr = self.cnmf.estimates.SNR_comp
+        # Get CNN predictions if available
+        cnn_preds = getattr(self.cnmf.estimates, 'cnn_preds', None)
+        has_cnn = cnn_preds is not None and len(cnn_preds) > 0
+        accepted_list = self.cnmf.estimates.accepted_list
+        rejected_list = self.cnmf.estimates.rejected_list
+        uncertain_list = getattr(self.cnmf.estimates, 'uncertain_list', np.array([], dtype=int))
+        
+        # Calculate contour area (number of non-zero pixels in spatial footprint)
+        A = self.cnmf.estimates.A  # Sparse matrix shape (N, K)
+        self.cnmf.estimates.areas = np.array([A[:, i].nnz for i in range(K)])  # Number of non-zero elements per component
+        
+        # Disable sorting temporarily to avoid issues during population
+        self.neuron_table.setSortingEnabled(False)
+        self.neuron_table.setRowCount(K)
+        
+        for i in range(K):
+            # ID - store as numeric type in EditRole for proper sorting
+            id_item = QtWidgets.QTableWidgetItem()
+            id_item.setData(QtCore.Qt.EditRole, i)  # Store as int - QVariant remembers type
+            id_item.setData(QtCore.Qt.DisplayRole, str(i))  # Display as string
+            id_item.setData(QtCore.Qt.UserRole, i)  # Store neuron ID
+            id_item.setFlags(id_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.neuron_table.setItem(i, 0, id_item)
+            
+            # Rval - store as numeric type in EditRole for proper sorting
+            rval_item = QtWidgets.QTableWidgetItem()
+            rval_item.setData(QtCore.Qt.EditRole, float(rval[i]))  # Store as float - QVariant remembers type
+            rval_item.setData(QtCore.Qt.DisplayRole, f'{rval[i]:.3f}')  # Display as formatted string
+            rval_item.setData(QtCore.Qt.UserRole, rval[i])
+            rval_item.setFlags(rval_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.neuron_table.setItem(i, 1, rval_item)
+            
+            # SNR - store as numeric type in EditRole for proper sorting
+            snr_item = QtWidgets.QTableWidgetItem()
+            snr_item.setData(QtCore.Qt.EditRole, float(snr[i]))  # Store as float - QVariant remembers type
+            snr_item.setData(QtCore.Qt.DisplayRole, f'{snr[i]:.2f}')  # Display as formatted string
+            snr_item.setData(QtCore.Qt.UserRole, snr[i])
+            snr_item.setFlags(snr_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.neuron_table.setItem(i, 2, snr_item)
+            
+            # CNN - store as numeric type in EditRole for proper sorting
+            cnn_item = QtWidgets.QTableWidgetItem()
+            if has_cnn and i < len(cnn_preds):
+                cnn_value = float(cnn_preds[i])
+                cnn_item.setData(QtCore.Qt.EditRole, cnn_value)  # Store as float - QVariant remembers type
+                cnn_item.setData(QtCore.Qt.DisplayRole, f'{cnn_value:.3f}')  # Display as formatted string
+                cnn_item.setData(QtCore.Qt.UserRole, cnn_value)
+            else:
+                cnn_item.setData(QtCore.Qt.EditRole, -1.0)  # Store as float - QVariant remembers type (N/A comes last)
+                cnn_item.setData(QtCore.Qt.DisplayRole, 'N/A')  # Display as string
+                cnn_item.setData(QtCore.Qt.UserRole, np.nan)
+            cnn_item.setFlags(cnn_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.neuron_table.setItem(i, 3, cnn_item)
+            
+            # Area (contour area size) - store as numeric type in EditRole for proper sorting
+            area_value = int(self.cnmf.estimates.areas[i])
+            area_item = QtWidgets.QTableWidgetItem()
+            area_item.setData(QtCore.Qt.EditRole, area_value)  # Store as int - QVariant remembers type
+            area_item.setData(QtCore.Qt.DisplayRole, str(area_value))  # Display as string
+            area_item.setData(QtCore.Qt.UserRole, area_value)
+            area_item.setFlags(area_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.neuron_table.setItem(i, 4, area_item)
+            
+            # Quality (based on idx_components or idx_components_bad)
+            idx_components = getattr(self.cnmf.estimates, 'idx_components', None)
+            idx_components_bad = getattr(self.cnmf.estimates, 'idx_components_bad', None)
+            if idx_components is not None and i in idx_components:
+                quality = 'Good'
+                quality_color = QtGui.QColor(200, 255, 200)  # Light green
+            elif idx_components_bad is not None and i in idx_components_bad:
+                quality = 'Bad'
+                quality_color = QtGui.QColor(255, 200, 200)  # Light red
+            else:
+                quality = 'Unknown'
+                quality_color = QtGui.QColor(240, 240, 240)  # Light gray
+            
+            quality_item = QtWidgets.QTableWidgetItem(quality)
+            quality_item.setData(QtCore.Qt.UserRole, i)
+            quality_item.setFlags(quality_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            quality_item.setBackground(quality_color)
+            quality_item.setForeground(QtGui.QColor(0, 0, 0))  # Black text color
+            self.neuron_table.setItem(i, 5, quality_item)
+            
+            # Status
+            if i in accepted_list:
+                status = 'Good'
+                color = QtGui.QColor(200, 255, 200)  # Light green
+            elif i in rejected_list:
+                status = 'Noise'
+                color = QtGui.QColor(255, 200, 200)  # Light red
+            elif i in uncertain_list:
+                status = 'Uncertain'
+                color = QtGui.QColor(255, 255, 200)  # Light yellow
+            else:
+                status = 'Unassigned'
+                color = QtGui.QColor(240, 240, 240)  # Light gray
+            
+            status_item = QtWidgets.QTableWidgetItem(status)
+            status_item.setData(QtCore.Qt.UserRole, i)
+            status_item.setFlags(status_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            status_item.setBackground(color)
+            status_item.setForeground(QtGui.QColor(0, 0, 0))  # Black text color
+            self.neuron_table.setItem(i, 6, status_item)
+        
+        # Resize columns to content
+        self.neuron_table.resizeColumnsToContents()
+        # Re-enable sorting
+        self.neuron_table.setSortingEnabled(True)
+        
+        # Apply current view mode filter
+        if hasattr(self, 'par2') and self.par2 is not None:
+            select_mode = self.par2.param('View components').value()
+            accepted_list = self.cnmf.estimates.accepted_list
+            rejected_list = self.cnmf.estimates.rejected_list
+            uncertain_list = getattr(self.cnmf.estimates, 'uncertain_list', np.array([], dtype=int))
+            self.filter_neuron_table(select_mode, accepted_list, rejected_list, uncertain_list)
+    
+    def on_table_selection_changed(self):
+        """Handle table selection change - sync with current neuron selection."""
+        if not self.loaded:
+            return
+        
+        # Get neuron IDs directly from selected items' UserRole data
+        # This works correctly even when table is sorted/reordered
+        selected_neuron_ids = []
+        selected_items = self.neuron_table.selectedItems()
+        
+        # Get unique neuron IDs from selected items (check all columns to get unique rows)
+        seen_rows = set()
+        for item in selected_items:
+            row = item.row()
+            if row not in seen_rows:
+                seen_rows.add(row)
+                # Get neuron ID from the ID column (column 0) of this row
+                # The UserRole data contains the actual neuron ID, not affected by sorting
+                id_item = self.neuron_table.item(row, 0)
+                if id_item:
+                    neuron_id = id_item.data(QtCore.Qt.UserRole)
+                    if neuron_id is not None:
+                        selected_neuron_ids.append(int(neuron_id))
+        
+        if selected_neuron_ids:
+                # Update selected cells
+                self.selected_cells = selected_neuron_ids
+                # Set this_cell to the first selected (or last if only one)
+                self.this_cell = selected_neuron_ids[0] if len(selected_neuron_ids) == 1 else selected_neuron_ids[-1]
+                
+                # Update UI
+                if len(selected_neuron_ids) == 1:
+                    self.par1.param('Cell ID').setValue(self.this_cell, blockSignal=self.change_cell)
+                    self.p1.setTitle('Component %d' % self.this_cell)
+                    self.p2.setTitle('Rval: %.3f SNR: %.2f'
+                                     % (self.cnmf.estimates.r_values[self.this_cell],
+                                        self.cnmf.estimates.SNR_comp[self.this_cell]))
+                else:
+                    self.par1.param('Cell ID').setValue(self.this_cell, blockSignal=self.change_cell)
+                    self.p1.setTitle(f'Components: {len(selected_neuron_ids)} selected')
+                    avg_rval = np.mean([self.cnmf.estimates.r_values[i] for i in selected_neuron_ids])
+                    avg_snr = np.mean([self.cnmf.estimates.SNR_comp[i] for i in selected_neuron_ids])
+                    self.p2.setTitle(f'Avg Rval: {avg_rval:.3f} Avg SNR: {avg_snr:.2f}')
+                
+                # Update displays
+                self.draw_fov_overall()
+                self.draw_scatter()
+                self.draw_trace()
+        else:
+            # No selection - clear
+            self.this_cell = None
+            self.selected_cells = []
+            self.par1.param('Cell ID').setValue(-1, blockSignal=self.change_cell)
+            self.p1.setTitle('')
+            self.p2.setTitle('')
+            self.draw_fov_overall()
+            self.draw_scatter()
+            self.draw_trace()
+    
+    def on_table_double_clicked(self, item):
+        """Handle double click on table item - focus on that neuron."""
+        row = item.row()
+        neuron_id_item = self.neuron_table.item(row, 0)
+        if neuron_id_item:
+            neuron_id = neuron_id_item.data(QtCore.Qt.UserRole)
+            if neuron_id is not None:
+                self.this_cell = int(neuron_id)
+                self.selected_cells = [self.this_cell]
+                self.update_selection(self.this_cell)
+    
+    def sync_table_selection(self):
+        """Sync table selection with current neuron selection."""
+        if not self.loaded:
+            return
+        
+        # Block signals to prevent recursive updates
+        self.neuron_table.blockSignals(True)
+        self.neuron_table.clearSelection()
+        
+        if self.selected_cells:
+            # Find rows with matching neuron IDs
+            rows_to_select = []
+            for row in range(self.neuron_table.rowCount()):
+                id_item = self.neuron_table.item(row, 0)
+                if id_item:
+                    neuron_id = id_item.data(QtCore.Qt.UserRole)
+                    if neuron_id in self.selected_cells:
+                        rows_to_select.append(row)
+            
+            # Select all matching rows
+            for row in rows_to_select:
+                self.neuron_table.selectRow(row)
+            
+            # Scroll to first selected item if any
+            if rows_to_select and self.this_cell is not None:
+                for row in range(self.neuron_table.rowCount()):
+                    id_item = self.neuron_table.item(row, 0)
+                    if id_item and id_item.data(QtCore.Qt.UserRole) == self.this_cell:
+                        self.neuron_table.scrollToItem(id_item)
+                        break
+        
+        self.neuron_table.blockSignals(False)
+    
+    def find_next_unlabeled_neuron(self, start_from=None):
+        """Find the next unlabeled (unassigned) neuron after the current one, based on table row order."""
+        if not self.loaded:
+            return None
+        
+        K = self.cnmf.estimates.C.shape[0]
+        accepted_list = self.cnmf.estimates.accepted_list
+        rejected_list = self.cnmf.estimates.rejected_list
+        uncertain_list = getattr(self.cnmf.estimates, 'uncertain_list', np.array([], dtype=int))
+        
+        # Get all labeled neurons
+        all_labeled = np.union1d(np.union1d(accepted_list, rejected_list), uncertain_list)
+        # Get unlabeled neurons
+        unlabeled_set = set(np.setdiff1d(np.arange(K), all_labeled))
+        
+        if len(unlabeled_set) == 0:
+            return None  # No unlabeled neurons
+        
+        # Find the current row in the table
+        current_row = None
+        if start_from is not None:
+            # Find the row containing the start_from neuron
+            for row in range(self.neuron_table.rowCount()):
+                id_item = self.neuron_table.item(row, 0)
+                if id_item:
+                    neuron_id = id_item.data(QtCore.Qt.UserRole)
+                    if neuron_id == start_from:
+                        current_row = row
+                        break
+        elif self.this_cell is not None:
+            # Find the row containing the current cell
+            for row in range(self.neuron_table.rowCount()):
+                id_item = self.neuron_table.item(row, 0)
+                if id_item:
+                    neuron_id = id_item.data(QtCore.Qt.UserRole)
+                    if neuron_id == self.this_cell:
+                        current_row = row
+                        break
+        
+        # Search from the next row after current_row (or from start if current_row is None)
+        start_row = (current_row + 1) if current_row is not None else 0
+        
+        # Look for next unlabeled neuron in table rows (respecting current sort order)
+        for row in range(start_row, self.neuron_table.rowCount()):
+            id_item = self.neuron_table.item(row, 0)
+            if id_item:
+                neuron_id = id_item.data(QtCore.Qt.UserRole)
+                if neuron_id is not None and neuron_id in unlabeled_set:
+                    return int(neuron_id)
+        
+        # If not found, wrap around and search from the beginning
+        for row in range(0, start_row):
+            id_item = self.neuron_table.item(row, 0)
+            if id_item:
+                neuron_id = id_item.data(QtCore.Qt.UserRole)
+                if neuron_id is not None and neuron_id in unlabeled_set:
+                    return int(neuron_id)
+        
+        return None
+    
+    def mark_neuron_good(self):
+        """Mark selected neuron(s) as good (accepted)."""
+        if not self.loaded or not self.selected_cells:
+            return
+        
+        # Store current cell for finding next unlabeled
+        current_cell = self.this_cell if self.this_cell is not None else self.selected_cells[0]
+        
+        self.cnmf.estimates.accepted_list = np.union1d(
+            self.cnmf.estimates.accepted_list, self.selected_cells)
+        self.cnmf.estimates.rejected_list = np.setdiff1d(
+            self.cnmf.estimates.rejected_list, self.selected_cells)
+        if hasattr(self.cnmf.estimates, 'uncertain_list'):
+            self.cnmf.estimates.uncertain_list = np.setdiff1d(
+                self.cnmf.estimates.uncertain_list, self.selected_cells)
+        self.update_neuron_table_status()
+        self.change_list(None, None)
+        if self.logger:
+            self.logger.info(f'Marked neurons {self.selected_cells} as Good')
+        
+        # Move to next unlabeled neuron
+        next_unlabeled = self.find_next_unlabeled_neuron(start_from=current_cell)
+        if next_unlabeled is not None:
+            self.this_cell = next_unlabeled
+            self.selected_cells = [next_unlabeled]
+            self.par1.param('Cell ID').setValue(next_unlabeled, blockSignal=self.change_cell)
+            self.p1.setTitle('Component %d' % next_unlabeled)
+            self.p2.setTitle('Rval: %.3f SNR: %.2f'
+                             % (self.cnmf.estimates.r_values[next_unlabeled],
+                                self.cnmf.estimates.SNR_comp[next_unlabeled]))
+            self.sync_table_selection()
+            self.draw_fov_overall()
+            self.draw_scatter()
+            self.draw_trace()
+    
+    def mark_neuron_noise(self):
+        """Mark selected neuron(s) as noise (rejected)."""
+        if not self.loaded or not self.selected_cells:
+            return
+        
+        # Store current cell for finding next unlabeled
+        current_cell = self.this_cell if self.this_cell is not None else self.selected_cells[0]
+        
+        self.cnmf.estimates.rejected_list = np.union1d(
+            self.cnmf.estimates.rejected_list, self.selected_cells)
+        self.cnmf.estimates.accepted_list = np.setdiff1d(
+            self.cnmf.estimates.accepted_list, self.selected_cells)
+        if hasattr(self.cnmf.estimates, 'uncertain_list'):
+            self.cnmf.estimates.uncertain_list = np.setdiff1d(
+                self.cnmf.estimates.uncertain_list, self.selected_cells)
+        self.update_neuron_table_status()
+        self.change_list(None, None)
+        if self.logger:
+            self.logger.info(f'Marked neurons {self.selected_cells} as Noise')
+        
+        # Move to next unlabeled neuron
+        next_unlabeled = self.find_next_unlabeled_neuron(start_from=current_cell)
+        if next_unlabeled is not None:
+            self.this_cell = next_unlabeled
+            self.selected_cells = [next_unlabeled]
+            self.par1.param('Cell ID').setValue(next_unlabeled, blockSignal=self.change_cell)
+            self.p1.setTitle('Component %d' % next_unlabeled)
+            self.p2.setTitle('Rval: %.3f SNR: %.2f'
+                             % (self.cnmf.estimates.r_values[next_unlabeled],
+                                self.cnmf.estimates.SNR_comp[next_unlabeled]))
+            self.sync_table_selection()
+            self.draw_fov_overall()
+            self.draw_scatter()
+            self.draw_trace()
+    
+    def mark_neuron_uncertain(self):
+        """Mark selected neuron(s) as uncertain."""
+        if not self.loaded or not self.selected_cells:
+            return
+        
+        # Store current cell for finding next unlabeled
+        current_cell = self.this_cell if self.this_cell is not None else self.selected_cells[0]
+        
+        if not hasattr(self.cnmf.estimates, 'uncertain_list'):
+            self.cnmf.estimates.uncertain_list = np.array([], dtype=int)
+        self.cnmf.estimates.uncertain_list = np.union1d(
+            self.cnmf.estimates.uncertain_list, self.selected_cells)
+        self.cnmf.estimates.accepted_list = np.setdiff1d(
+            self.cnmf.estimates.accepted_list, self.selected_cells)
+        self.cnmf.estimates.rejected_list = np.setdiff1d(
+            self.cnmf.estimates.rejected_list, self.selected_cells)
+        self.update_neuron_table_status()
+        self.change_list(None, None)
+        if self.logger:
+            self.logger.info(f'Marked neurons {self.selected_cells} as Uncertain')
+        
+        # Move to next unlabeled neuron
+        next_unlabeled = self.find_next_unlabeled_neuron(start_from=current_cell)
+        if next_unlabeled is not None:
+            self.this_cell = next_unlabeled
+            self.selected_cells = [next_unlabeled]
+            self.par1.param('Cell ID').setValue(next_unlabeled, blockSignal=self.change_cell)
+            self.p1.setTitle('Component %d' % next_unlabeled)
+            self.p2.setTitle('Rval: %.3f SNR: %.2f'
+                             % (self.cnmf.estimates.r_values[next_unlabeled],
+                                self.cnmf.estimates.SNR_comp[next_unlabeled]))
+            self.sync_table_selection()
+            self.draw_fov_overall()
+            self.draw_scatter()
+            self.draw_trace()
+    
+    def update_neuron_table_status(self):
+        """Update status column in neuron table."""
+        if not self.loaded:
+            return
+        
+        accepted_list = self.cnmf.estimates.accepted_list
+        rejected_list = self.cnmf.estimates.rejected_list
+        uncertain_list = getattr(self.cnmf.estimates, 'uncertain_list', np.array([], dtype=int))
+        K = self.cnmf.estimates.C.shape[0]
+        
+        # Disable sorting temporarily
+        self.neuron_table.setSortingEnabled(False)
+        
+        # Iterate through all rows and update status based on neuron ID stored in UserRole
+        # This works correctly even when table is sorted
+        for row in range(self.neuron_table.rowCount()):
+            # Get the neuron ID from the ID column (column 0)
+            id_item = self.neuron_table.item(row, 0)
+            if id_item:
+                neuron_id = id_item.data(QtCore.Qt.UserRole)
+                if neuron_id is not None:
+                    neuron_id = int(neuron_id)
+                    # Get the status item for this row (column 6, after Quality)
+                    status_item = self.neuron_table.item(row, 6)
+                    if status_item:
+                        if neuron_id in accepted_list:
+                            status = 'Good'
+                            color = QtGui.QColor(200, 255, 200)  # Light green
+                        elif neuron_id in rejected_list:
+                            status = 'Noise'
+                            color = QtGui.QColor(255, 200, 200)  # Light red
+                        elif neuron_id in uncertain_list:
+                            status = 'Uncertain'
+                            color = QtGui.QColor(255, 255, 200)  # Light yellow
+                        else:
+                            status = 'Unassigned'
+                            color = QtGui.QColor(240, 240, 240)  # Light gray
+                        
+                        status_item.setText(status)
+                        status_item.setBackground(color)
+                        status_item.setForeground(QtGui.QColor(0, 0, 0))  # Black text color
+        
+        # Re-enable sorting
+        self.neuron_table.setSortingEnabled(True)
+        self.print_info()
+    
+    def update_neuron_table_quality(self):
+        """Update quality column in neuron table based on idx_components and idx_components_bad."""
+        if not self.loaded:
+            return
+        
+        idx_components = getattr(self.cnmf.estimates, 'idx_components', None)
+        idx_components_bad = getattr(self.cnmf.estimates, 'idx_components_bad', None)
+        
+        if idx_components is None and idx_components_bad is None:
+            return  # Quality not yet determined
+        
+        # Disable sorting temporarily
+        self.neuron_table.setSortingEnabled(False)
+        
+        # Iterate through all rows and update quality based on neuron ID stored in UserRole
+        # This works correctly even when table is sorted
+        for row in range(self.neuron_table.rowCount()):
+            # Get the neuron ID from the ID column (column 0)
+            id_item = self.neuron_table.item(row, 0)
+            if id_item:
+                neuron_id = id_item.data(QtCore.Qt.UserRole)
+                if neuron_id is not None:
+                    neuron_id = int(neuron_id)
+                    # Get the quality item for this row (column 5)
+                    quality_item = self.neuron_table.item(row, 5)
+                    if quality_item:
+                        if idx_components is not None and neuron_id in idx_components:
+                            quality = 'Good'
+                            quality_color = QtGui.QColor(200, 255, 200)  # Light green
+                        elif idx_components_bad is not None and neuron_id in idx_components_bad:
+                            quality = 'Bad'
+                            quality_color = QtGui.QColor(255, 200, 200)  # Light red
+                        else:
+                            quality = 'Unknown'
+                            quality_color = QtGui.QColor(240, 240, 240)  # Light gray
+                        
+                        quality_item.setText(quality)
+                        quality_item.setBackground(quality_color)
+                        quality_item.setForeground(QtGui.QColor(0, 0, 0))  # Black text color
+        
+        # Re-enable sorting
+        self.neuron_table.setSortingEnabled(True)
+    
+    def filter_neuron_table(self, select_mode, accepted_list, rejected_list, uncertain_list):
+        """Filter neuron table rows based on view mode (show/hide rows)."""
+        if not self.loaded:
+            return
+        
+        # Disable sorting temporarily to avoid issues during filtering
+        self.neuron_table.setSortingEnabled(False)
+        
+        # Determine which neurons should be visible based on view mode
+        K = self.neuron_table.rowCount()
+        
+        for row in range(K):
+            # Get the neuron ID from the ID column (column 0)
+            id_item = self.neuron_table.item(row, 0)
+            if id_item:
+                neuron_id = id_item.data(QtCore.Qt.UserRole)
+                if neuron_id is not None:
+                    neuron_id = int(neuron_id)
+                    
+                    # Determine visibility based on view mode
+                    if select_mode == 'All':
+                        visible = True
+                    elif select_mode == 'Accepted':
+                        visible = neuron_id in accepted_list
+                    elif select_mode == 'Rejected':
+                        visible = neuron_id in rejected_list
+                    elif select_mode == 'Uncertain':
+                        visible = neuron_id in uncertain_list
+                    elif select_mode == 'Unassigned':
+                        all_labeled = np.union1d(np.union1d(accepted_list, rejected_list), uncertain_list)
+                        visible = neuron_id not in all_labeled
+                    else:
+                        visible = True
+                    
+                    # Show or hide the row
+                    self.neuron_table.setRowHidden(row, not visible)
+        
+        # Re-enable sorting
+        self.neuron_table.setSortingEnabled(True)
             
     def change_image(self):
         img_to_plot = self.par1.param('Image').value()
@@ -590,47 +1144,61 @@ class MainWindow(QtWidgets.QMainWindow):
         '''Plot fluorescence traces of selected cells with predefined color cycle (self.colors -> plt.cm.Set3)
         '''
         self.p3.clearPlots()
+        if not self.loaded or not self.selected_cells:
+            return
+        
         fr = self.cnmf.params.data['fr']
         T = self.cnmf.estimates.C.shape[1]
         trace = self.par1.param('Trace').value()
-        if self.mode in {'neurons', 'correlation'}:
-            for i, idx in enumerate(self.selected_cells):  # Replot for all cells
+        
+        # Handle multiple selected cells - draw traces for all selected
+        if len(self.selected_cells) > 0:
+            for i, idx in enumerate(self.selected_cells):
                 if trace == 'Raw':
                     f = self.cnmf.estimates.C[idx] + self.cnmf.estimates.YrA[idx]
                 elif trace == 'Denoised':
                     f = self.cnmf.estimates.C[idx]
                 elif trace == 'Spike':
                     f = self.cnmf.estimates.S[idx]
-                if self.mode == 'neurons':
-                    ii = i % len(self.colors)  # Remainder (cyclic colors if selected more than 12 cells)
-                    self.p3.plot(np.arange(T)/fr, i+f/f.max(), pen=self.colors[ii])  # Normalized trace and shifted vertically 
-                elif self.mode == 'correlation':  # Only one cell selected is possible
-                    self.p3.plot(np.arange(T)/fr, f, pen=self.colors[0])  # Original intensity
-        elif self.mode in {'accepted', 'neighbors'}:
-            idx = self.this_cell
-            if trace == 'Raw':
-                f = self.cnmf.estimates.C[idx] + self.cnmf.estimates.YrA[idx]
-            elif trace == 'Denoised':
-                f = self.cnmf.estimates.C[idx]
-            elif trace == 'Spike':
-                f = self.cnmf.estimates.S[idx]
-            if self.mode == 'accepted':
-                self.p3.plot(np.arange(T)/fr, f, pen='m')  # self.colors[0]
-            elif self.mode == 'neighbors':
-                self.p3.plot(np.arange(T)/fr, f/f.max(), pen='m')  # self.colors[3]
-                scores = self.corr_matrix[self.this_cell]
-                scores = (scores-np.nanmin(scores))/(np.nanmax(scores)-np.nanmin(scores))
-                colors = plt.cm.jet(scores, bytes=True)[:,:3].tolist()
-                if len(self.neighbor_cells) > 0:
-                    orders = np.argsort(scores[self.neighbor_cells])[::-1]  # Sort from high to low correlation
-                    for i, idx in enumerate(self.neighbor_cells[orders]):  # High correlation component is close to the selected cell
-                        if trace == 'Raw':
-                            f = self.cnmf.estimates.C[idx] + self.cnmf.estimates.YrA[idx]
-                        elif trace == 'Denoised':
-                            f = self.cnmf.estimates.C[idx]
-                        elif trace == 'Spike':
-                            f = self.cnmf.estimates.S[idx]
-                        self.p3.plot(np.arange(T)/fr, i+1+f/f.max(), pen=colors[idx])
+                
+                if self.mode in {'neurons', 'correlation'}:
+                    if self.mode == 'neurons':
+                        ii = i % len(self.colors)  # Remainder (cyclic colors if selected more than 12 cells)
+                        self.p3.plot(np.arange(T)/fr, i+f/f.max(), pen=self.colors[ii])  # Normalized trace and shifted vertically 
+                    elif self.mode == 'correlation':
+                        if len(self.selected_cells) == 1:
+                            self.p3.plot(np.arange(T)/fr, f, pen=self.colors[0])  # Original intensity
+                        else:
+                            # For multiple in correlation mode, show normalized and shifted
+                            self.p3.plot(np.arange(T)/fr, i+f/f.max(), pen=self.colors[i % len(self.colors)])
+                elif self.mode in {'accepted', 'neighbors'}:
+                    if len(self.selected_cells) == 1:
+                        # Single selection - original behavior
+                        if self.mode == 'accepted':
+                            self.p3.plot(np.arange(T)/fr, f, pen='m')
+                        elif self.mode == 'neighbors':
+                            self.p3.plot(np.arange(T)/fr, f/f.max(), pen='m')
+                            scores = self.corr_matrix[self.this_cell]
+                            scores = (scores-np.nanmin(scores))/(np.nanmax(scores)-np.nanmin(scores))
+                            colors = plt.cm.jet(scores, bytes=True)[:,:3].tolist()
+                            if len(self.neighbor_cells) > 0:
+                                orders = np.argsort(scores[self.neighbor_cells])[::-1]  # Sort from high to low correlation
+                                for j, neighbor_idx in enumerate(self.neighbor_cells[orders]):  # High correlation component is close to the selected cell
+                                    if trace == 'Raw':
+                                        f_neighbor = self.cnmf.estimates.C[neighbor_idx] + self.cnmf.estimates.YrA[neighbor_idx]
+                                    elif trace == 'Denoised':
+                                        f_neighbor = self.cnmf.estimates.C[neighbor_idx]
+                                    elif trace == 'Spike':
+                                        f_neighbor = self.cnmf.estimates.S[neighbor_idx]
+                                    self.p3.plot(np.arange(T)/fr, j+1+f_neighbor/f_neighbor.max(), pen=colors[neighbor_idx])
+                    else:
+                        # Multiple selections - show all traces
+                        ii = i % len(self.colors)
+                        self.p3.plot(np.arange(T)/fr, i+f/f.max(), pen=self.colors[ii])
+                else:
+                    # Default mode - show normalized and shifted
+                    ii = i % len(self.colors)
+                    self.p3.plot(np.arange(T)/fr, i+f/f.max(), pen=self.colors[ii])
                 
     # %% Mouse and keyboard interaction
     def update_selection(self, this_cell):
@@ -659,14 +1227,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self.p1.setTitle('')
             self.p2.setTitle('')
             self.par1.param('Cell ID').setValue(-1, blockSignal=self.change_cell)
+            # No selection - clear table selection too
+            self.neuron_table.clearSelection()
         else:
-            self.p1.setTitle('Component %d' %self.this_cell)  # *self.yx
-            self.p2.setTitle('Rval: %.3f SNR: %.2f'
-                             %(self.cnmf.estimates.r_values[self.this_cell],
-                               self.cnmf.estimates.SNR_comp[self.this_cell]))
+            # Update title and info based on number of selected cells
+            if len(self.selected_cells) == 1:
+                self.p1.setTitle('Component %d' %self.this_cell)  # *self.yx
+                self.p2.setTitle('Rval: %.3f SNR: %.2f'
+                                 %(self.cnmf.estimates.r_values[self.this_cell],
+                                   self.cnmf.estimates.SNR_comp[self.this_cell]))
+            else:
+                # Multiple cells selected
+                self.p1.setTitle(f'Components: {len(self.selected_cells)} selected')
+                avg_rval = np.mean([self.cnmf.estimates.r_values[i] for i in self.selected_cells])
+                avg_snr = np.mean([self.cnmf.estimates.SNR_comp[i] for i in self.selected_cells])
+                self.p2.setTitle(f'Avg Rval: {avg_rval:.3f} Avg SNR: {avg_snr:.2f}')
             self.par1.param('Cell ID').setValue(self.this_cell,
                                                 blockSignal=self.change_cell)
+            # Sync table selection - this will select all rows for selected_cells
+            self.sync_table_selection()
         self.draw_fov_overall()
+        self.draw_scatter()
         self.draw_trace()
             
     def mouse_clicked(self, event):
@@ -709,7 +1290,40 @@ class MainWindow(QtWidgets.QMainWindow):
         
     def keyPressEvent(self, event):
         '''Override the existing method to activate left/right key to scroll through the cell ID
+        and Alt+G/N/M for marking neurons
         '''
+        # Handle ESC key to unselect all neurons
+        if event.key() == QtCore.Qt.Key_Escape:
+            # Reset scatter plot pens for currently selected cells
+            if self.loaded and self.selected_cells:
+                for i in self.selected_cells:
+                    try:
+                        self.scatter.points()[i].resetPen()
+                    except (IndexError, AttributeError):
+                        pass  # Scatter point might not exist
+            self.this_cell = None
+            self.selected_cells = []
+            self.par1.param('Cell ID').setValue(-1, blockSignal=self.change_cell)
+            self.p1.setTitle('')
+            self.p2.setTitle('')
+            self.neuron_table.clearSelection()
+            self.draw_fov_overall()
+            self.draw_scatter()
+            self.draw_trace()
+            return
+        
+        # Handle Alt+G (Good), Alt+N (Noise), Alt+M (Uncertain) shortcuts
+        if event.modifiers() == QtCore.Qt.AltModifier:
+            if event.key() == QtCore.Qt.Key_G:
+                self.mark_neuron_good()
+                return
+            elif event.key() == QtCore.Qt.Key_N:
+                self.mark_neuron_noise()
+                return
+            elif event.key() == QtCore.Qt.Key_M:
+                self.mark_neuron_uncertain()
+                return
+        
         if self.mode in {'accepted', 'neighbors'}:
             accepted_list = self.cnmf.estimates.accepted_list
             K2 = len(accepted_list)
@@ -732,6 +1346,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                    self.cnmf.estimates.SNR_comp[self.this_cell]))
                 self.scatter.points()[self.last_cell].resetPen()
                 self.scatter.points()[self.this_cell].setPen('w', width=2)
+                # Sync table selection
+                self.sync_table_selection()
                 ## Compute neighbor cells
                 if self.mode == 'neighbors':
                     radius = self.par1.param('Dist pix').value() 
@@ -756,6 +1372,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.scatter.points()[i].resetPen()
         self.scatter.points()[self.this_cell].setPen('w', width=2)
         self.selected_cells = [self.this_cell]
+        # Sync table selection
+        self.sync_table_selection()
         ## Compute neighbor cells
         if self.mode == 'neighbors':
             accepted_list = self.cnmf.estimates.accepted_list
@@ -810,10 +1428,15 @@ class MainWindow(QtWidgets.QMainWindow):
             ## Update accepted list, figures...
             self.cnmf.estimates.accepted_list = update_list(K, self.cnmf.estimates.accepted_list, self.selected_cells)
             self.cnmf.estimates.rejected_list = update_list(K, self.cnmf.estimates.rejected_list, self.selected_cells)
+            if hasattr(self.cnmf.estimates, 'uncertain_list'):
+                self.cnmf.estimates.uncertain_list = update_list(K, self.cnmf.estimates.uncertain_list, self.selected_cells)
             self.this_cell = K1-1  # The merged component
             self.selected_cells = [K1-1]
             self.change_metric(plot=False)
             self.change_list(None, None)
+            # Update table after merge (need to repopulate since neuron count changed)
+            if self.loaded:
+                self.populate_neuron_table()
             
     # %% Change idx_components, accepted_list and save data
     def add_group(self):
@@ -826,6 +1449,10 @@ class MainWindow(QtWidgets.QMainWindow):
             np.union1d(self.cnmf.estimates.accepted_list, self.cnmf.estimates.idx_components)  # union of two arrays
         self.cnmf.estimates.rejected_list = \
             np.setdiff1d(self.cnmf.estimates.rejected_list, self.cnmf.estimates.idx_components)  # unique values in arg1 that are not in arg2
+        if hasattr(self.cnmf.estimates, 'uncertain_list'):
+            self.cnmf.estimates.uncertain_list = \
+                np.setdiff1d(self.cnmf.estimates.uncertain_list, self.cnmf.estimates.idx_components)
+        self.update_neuron_table_status()
         self.change_list(None, None)
         
     def remove_group(self):
@@ -838,6 +1465,10 @@ class MainWindow(QtWidgets.QMainWindow):
             np.union1d(self.cnmf.estimates.rejected_list, self.cnmf.estimates.idx_components)
         self.cnmf.estimates.accepted_list = \
             np.setdiff1d(self.cnmf.estimates.accepted_list, self.cnmf.estimates.idx_components)
+        if hasattr(self.cnmf.estimates, 'uncertain_list'):
+            self.cnmf.estimates.uncertain_list = \
+                np.setdiff1d(self.cnmf.estimates.uncertain_list, self.cnmf.estimates.idx_components)
+        self.update_neuron_table_status()
         self.change_list(None, None)
         
     def add_selected(self):
@@ -850,6 +1481,10 @@ class MainWindow(QtWidgets.QMainWindow):
             np.union1d(self.cnmf.estimates.accepted_list, self.selected_cells)
         self.cnmf.estimates.rejected_list = \
             np.setdiff1d(self.cnmf.estimates.rejected_list, self.selected_cells)
+        if hasattr(self.cnmf.estimates, 'uncertain_list'):
+            self.cnmf.estimates.uncertain_list = \
+                np.setdiff1d(self.cnmf.estimates.uncertain_list, self.selected_cells)
+        self.update_neuron_table_status()
         self.this_cell = None
         self.selected_cells = []
         self.change_list(None, None)
@@ -864,6 +1499,10 @@ class MainWindow(QtWidgets.QMainWindow):
             np.union1d(self.cnmf.estimates.rejected_list, self.selected_cells)
         self.cnmf.estimates.accepted_list = \
             np.setdiff1d(self.cnmf.estimates.accepted_list, self.selected_cells)
+        if hasattr(self.cnmf.estimates, 'uncertain_list'):
+            self.cnmf.estimates.uncertain_list = \
+                np.setdiff1d(self.cnmf.estimates.uncertain_list, self.selected_cells)
+        self.update_neuron_table_status()
         if self.mode in {'neurons', 'correlation'}:
             self.this_cell = None
             self.p1.setTitle('')
@@ -886,6 +1525,7 @@ class MainWindow(QtWidgets.QMainWindow):
         K = self.cnmf.estimates.C.shape[0]
         accepted_list = self.cnmf.estimates.accepted_list
         rejected_list = self.cnmf.estimates.rejected_list
+        uncertain_list = getattr(self.cnmf.estimates, 'uncertain_list', np.array([], dtype=int))
         if self.par2.param('Filter components').value():
             set_par = self.par2.child('Quality thr').getValues()
             par_dict = {'rval_thr': set_par['Rval high'][0],
@@ -895,33 +1535,76 @@ class MainWindow(QtWidgets.QMainWindow):
                         'min_cnn_thr': set_par['CNN high'][0],
                         'cnn_lowest': set_par['CNN low'][0]}
             self.cnmf.params.quality.update(par_dict)  # Renew caiman thresholds
-            # estimates.filter_components(mov, params_obj, dview=None,
-            #                             select_mode=select_mode)  # Need mov here ??
             ## ======== Filter Components ============ ##
-            ## Rval/SNR low and high thresholds (CNN not used here)
+            ## Rval/SNR/CNN low and high thresholds
             rval = self.cnmf.estimates.r_values
             snr = self.cnmf.estimates.SNR_comp
-            low_thr = (rval>=set_par['Rval low'][0]) & (snr>=set_par['SNR low'][0])
-            high_thr = (rval>=set_par['Rval high'][0]) | (snr>=set_par['SNR high'][0])
+            if hasattr(self.cnmf.estimates, 'cnn_preds'):
+                cnn = self.cnmf.estimates.cnn_preds
+            else:
+                cnn = np.ones(K)
+            areas = self.cnmf.estimates.areas
+            low_thr = (rval>=set_par['Rval low'][0]) & (snr>=set_par['SNR low'][0]) & (areas>=set_par['Area low'][0]) & (cnn>=set_par['CNN low'][0])
+            high_thr = (rval>=set_par['Rval high'][0]) | (snr>=set_par['SNR high'][0]) | (cnn>=set_par['CNN high'][0])
             good_idx = np.arange(K)[low_thr & high_thr]
         else:  # Not to filter components (Original Caiman GUI: filter with default setting -> this makes thing complicated...)
             good_idx = np.arange(K)
-        select_mode = self.par2.param('View components').value()  # 'All'|'Accepted'|'Rejected'|'Unassigned'
+        select_mode = self.par2.param('View components').value()  # 'All'|'Accepted'|'Rejected'|'Uncertain'|'Unassigned'
         if select_mode == 'Accepted':
-            good_idx = np.intersect1d(good_idx, accepted_list)
+            good_idx_selected = np.intersect1d(good_idx, accepted_list)
         elif select_mode == 'Rejected':
-            good_idx = np.intersect1d(good_idx, rejected_list)
+            good_idx_selected = np.intersect1d(good_idx, rejected_list)
+        elif select_mode == 'Uncertain':
+            good_idx_selected = np.intersect1d(good_idx, uncertain_list)
         elif select_mode == 'Unassigned':
-            good_idx = np.setdiff1d(good_idx,
-                                    np.union1d(rejected_list, accepted_list)) 
+            good_idx_selected = np.setdiff1d(good_idx,
+                                    np.union1d(np.union1d(rejected_list, accepted_list), uncertain_list))
+        else:  # 'All'
+            good_idx_selected = good_idx
+
         bad_idx = np.setdiff1d(np.arange(K), good_idx)
         self.cnmf.estimates.idx_components = good_idx
         self.cnmf.estimates.idx_components_bad = bad_idx
+        # Update quality column in table
+        self.update_neuron_table_quality()
+        # Filter table rows based on view mode
+        self.filter_neuron_table(select_mode, accepted_list, rejected_list, uncertain_list)
         self.draw_fov_overall()
         self.draw_scatter()
         self.draw_trace()
         self.print_info()
         
+    def setup_logger(self, save_folder):
+        """Setup logger to write to save folder location."""
+        if save_folder is None or save_folder == '':
+            return
+        
+        save_path = Path(save_folder)
+        if not save_path.exists():
+            return
+        
+        # Create logger
+        logger_name = 'caiman_gui'
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(logging.INFO)
+        
+        # Remove existing handlers to avoid duplicates
+        logger.handlers = []
+        
+        # Create log file in save folder
+        current_datetime = datetime.datetime.now().strftime("_%Y%m%d_%H%M%S")
+        log_filename = 'caiman_gui' + current_datetime + '.log'
+        log_path = save_path / log_filename
+        
+        # Add file handler
+        handler = logging.FileHandler(log_path)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        
+        self.logger = logger
+        logger.info(f'Logger initialized. Log file: {log_path}')
+    
     def save_data(self, new=True):
         if new:
             fname_save = FileDialog().getSaveFileName(filter='HDF5 (*.hdf5);;NWB (*.nwb)')[0]
@@ -932,6 +1615,14 @@ class MainWindow(QtWidgets.QMainWindow):
         elif os.path.splitext(fname_save)[1] == '.nwb':
             import nwb
             nwb.save_nwb(self.cnmf, fname_save, self.config, raw_data_file=None)
+        
+        # Setup logger in save folder
+        if fname_save:
+            save_folder = os.path.dirname(fname_save)
+            self.setup_logger(save_folder)
+            if self.logger:
+                self.logger.info(f'Data saved to: {fname_save}')
+        
         self.statusBar().showMessage('Saved: '+fname_save)
         
 # %% Useful functions
@@ -1075,18 +1766,11 @@ def update_list(K, list_idx, merge_idx):
     list_merged = np.where(bool_tmp)[0]
     return list_merged
     
-# %% Execute application event loop
 def main():
-    """Main entry point for the CaImAn GUI application."""
-    ## Initializing Qt
     app = QtWidgets.QApplication(sys.argv)
-    # Fix for double text in parametertree action buttons (issue #2380)
-    # Set style to Fusion to prevent duplicate text on action buttons
     app.setStyle("Fusion")
-    ## Instantiate the MainWindow class
+
     win = MainWindow()
-    # win = MainWindow(jsonpath='config_nwb.json')
-    # win = MainWindow(datapath=r'D:\Miniscope\2019-11-20-11-55-39_video1_memmap__d1_714_d2_728_d3_1_order_C_frames_6130_.hdf5')
     win.show()
     sys.exit(app.exec())
 

@@ -5,9 +5,10 @@ CaImAn Processing Runner - GUI for running CaImAn processing pipeline
 Dohoung Kim (kimd42@postech.ac.kr)
 """
 import os
-import sys
 import json
 import time
+import logging
+import datetime
 from pathlib import Path
 from natsort import natsorted
 
@@ -24,6 +25,8 @@ from caiman.utils.visualization import nb_inspect_correlation_pnr
 
 pg.setConfigOptions(imageAxisOrder='row-major')
 
+logger = logging.getLogger("caiman")
+logger.setLevel(logging.WARNING)
 
 class CaimanRunner(QtWidgets.QDialog):
     """Dialog for running CaImAn processing pipeline."""
@@ -33,7 +36,7 @@ class CaimanRunner(QtWidgets.QDialog):
         self.setWindowTitle('CaImAn Processing Runner')
         self.resize(1200, 700)
         
-        # Set window icon
+        # Icon
         icon_path = os.path.join(os.path.dirname(__file__), '..', 'images', 'Caiman_logo_2.png')
         if os.path.exists(icon_path):
             self.setWindowIcon(QtGui.QIcon(icon_path))
@@ -59,6 +62,7 @@ class CaimanRunner(QtWidgets.QDialog):
         self._syncing_min_corr = False  # Flag to prevent infinite sync loops
         self._syncing_min_pnr = False  # Flag to prevent infinite sync loops
         self.selected_files = []  # List of selected file paths
+        self.save_logger = None  # Logger instance for save folder
         
         # Main horizontal layout (left panel + right panel)
         main_layout = QtWidgets.QHBoxLayout()
@@ -89,8 +93,10 @@ class CaimanRunner(QtWidgets.QDialog):
         file_btn_layout = QtWidgets.QHBoxLayout()
         self.select_all_files_btn = QtWidgets.QPushButton('Select All')
         self.select_all_files_btn.clicked.connect(self.select_all_files)
+        self.select_all_files_btn.setEnabled(False)  # Initially disabled
         self.deselect_all_files_btn = QtWidgets.QPushButton('Deselect All')
         self.deselect_all_files_btn.clicked.connect(self.deselect_all_files)
+        self.deselect_all_files_btn.setEnabled(False)  # Initially disabled
         file_btn_layout.addWidget(self.select_all_files_btn)
         file_btn_layout.addWidget(self.deselect_all_files_btn)
         left_layout.addLayout(file_btn_layout)
@@ -136,7 +142,7 @@ class CaimanRunner(QtWidgets.QDialog):
         # Video display
         self.video_label = QtWidgets.QLabel('No video loaded')
         self.video_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.video_label.setMinimumSize(600, 400)
+        self.video_label.setMinimumSize(600, 600)
         self.video_label.setStyleSheet("background-color: black; color: white;")
         right_layout.addWidget(self.video_label)
         
@@ -269,27 +275,46 @@ class CaimanRunner(QtWidgets.QDialog):
         """Setup parameter tree with default values."""
         params = [
             {'name': 'Data Parameters', 'type': 'group', 'children': [
-                {'name': 'Data Directory', 'type': 'str', 'value': '', 'readonly': True},
-                {'name': 'Frame Rate (Hz)', 'type': 'float', 'value': 20.0},
-                {'name': 'Decay Time', 'type': 'float', 'value': 0.4},
+                {'name': 'Data Directory', 'type': 'str', 'value': '', 'readonly': True,
+                 'tip': 'Directory containing video files (.avi) to process'},
+                {'name': 'Frame Rate (Hz)', 'type': 'float', 'value': 20.0,
+                 'tip': 'Acquisition frame rate in Hz (frames per second). Used for temporal analysis and deconvolution.'},
+                {'name': 'Decay Time', 'type': 'float', 'value': 0.4,
+                 'tip': 'Expected decay time constant of calcium indicator (in seconds). Used for deconvolution. Typical values: GCaMP6s ~0.4s, GCaMP6f ~0.2s'},
             ]},
             {'name': 'Cluster Parameters', 'type': 'group', 'children': [
-                {'name': 'Number of Processes', 'type': 'int', 'value': 8, 'limits': (1, 32)},
+                {'name': 'Number of Processes', 'type': 'int', 'value': 8, 'limits': (1, 32),
+                 'tip': 'Number of parallel processes for computation. Higher values speed up processing but use more CPU/memory.'},
             ]},
             {'name': 'Motion Correction', 'type': 'group', 'children': [
-                {'name': 'gSig_filt', 'type': 'int', 'value': 3, 'limits': (1, 33)},
-                {'name': 'max_shifts', 'type': 'int', 'value': 20},
+                {'name': 'gSig_filt', 'type': 'int', 'value': 6, 'limits': (1, 33),
+                 'tip': 'Size of Gaussian kernel for spatial filtering before motion correction (in pixels).'},
+                {'name': 'max_shifts', 'type': 'int', 'value': 20,
+                 'tip': 'Maximum allowed shift in pixels for motion correction. Increase if there is significant motion in the video.'},
             ]},
             {'name': 'CNMF-E Parameters', 'type': 'group', 'children': [
-                {'name': 'gSig', 'type': 'int', 'value': 6, 'limits': (1, 12)},
-                {'name': 'gSiz', 'type': 'int', 'value': 15},
-                {'name': 'min_corr', 'type': 'float', 'value': 0.85, 'limits': (0, 1), 'step': 0.01},
-                {'name': 'min_pnr', 'type': 'float', 'value': 10.0},
-                {'name': 'merge_thr', 'type': 'float', 'value': 0.65, 'limits': (0, 1), 'step': 0.01},
+                {'name': 'p', 'type': 'int', 'value': 1, 'limits': (0, 2),
+                 'tip': 'Order of autoregressive model for deconvolution. p=1 for exponential decay, p=2 for double exponential. Usually 1 for calcium imaging.'},
+                {'name': 'gSig', 'type': 'int', 'value': 6, 'limits': (1, 12),
+                 'tip': 'Expected half-size of neurons (in pixels). Critical parameter: should match the typical radius of neurons in your data. Use Preview to validate.'},
+                {'name': 'gSiz', 'type': 'int', 'value': 15,
+                 'tip': 'Size of spatial component (in pixels). Typically 2-3 times gSig. Should encompass the full neuron footprint.'},
+                {'name': 'min_corr', 'type': 'float', 'value': 0.8, 'limits': (0, 1), 'step': 0.01,
+                 'tip': 'Minimum local correlation threshold for neuron detection. Higher values detect only high-quality neurons. Use Preview to adjust based on correlation image.'},
+                {'name': 'min_pnr', 'type': 'float', 'value': 10.0,
+                 'tip': 'Minimum peak-to-noise ratio threshold for neuron detection. Higher values detect only bright, high-SNR neurons. Use Preview to adjust based on PNR image.'},
+                {'name': 'patch_size', 'type': 'int', 'value': 48, 'limits': (1, 128),
+                 'tip': 'Size of patches for parallel processing (in pixels). Smaller values use less memory but may be slower. Recommended: 32-64 pixels.'},
+                {'name': 'stride', 'type': 'int', 'value': 16, 'limits': (1, 128),
+                 'tip': 'Overlap between patches (in pixels). Should be at least gSiz to avoid boundary effects. Typically patch_size/4.'},
+                {'name': 'merge_thr', 'type': 'float', 'value': 0.7, 'limits': (0, 1), 'step': 0.01,
+                 'tip': 'Threshold for merging similar components. Higher values merge fewer components (more conservative). Lower values merge more aggressively.'},
             ]},
             {'name': 'Quality Control', 'type': 'group', 'children': [
-                {'name': 'min_SNR', 'type': 'float', 'value': 1.5},
-                {'name': 'rval_thr', 'type': 'float', 'value': 0.85, 'limits': (0, 1), 'step': 0.01},
+                {'name': 'min_SNR', 'type': 'float', 'value': 2.0,
+                 'tip': 'Minimum signal-to-noise ratio for accepting components. Components with SNR below this are rejected. Typical range: 1.0-3.0.'},
+                {'name': 'rval_thr', 'type': 'float', 'value': 0.85, 'limits': (0, 1), 'step': 0.01,
+                 'tip': 'Minimum spatial correlation (r-value) for accepting components. Measures how well the spatial footprint matches the data. Range: 0-1, higher is better.'},
             ]},
         ]
         self.params = Parameter.create(name='params', type='group', children=params)
@@ -318,11 +343,16 @@ class CaimanRunner(QtWidgets.QDialog):
         self.selected_files = []
         
         for file_path in avi_files:
-            item = QtWidgets.QListWidgetItem(file_path.name)
+            item = QtWidgets.QListWidgetItem(Path(file_path).name)
             item.setCheckState(QtCore.Qt.Checked)  # All files selected by default
             item.setData(QtCore.Qt.UserRole, file_path)  # Store full path
             self.file_list.addItem(item)
             self.selected_files.append(file_path)
+        
+        # Enable select/deselect buttons when files are loaded
+        has_files = len(avi_files) > 0
+        self.select_all_files_btn.setEnabled(has_files)
+        self.deselect_all_files_btn.setEnabled(has_files)
         
         self.update_buttons_state()
     
@@ -368,6 +398,35 @@ class CaimanRunner(QtWidgets.QDialog):
         self.progress_text.append(message)
         QtWidgets.QApplication.processEvents()
     
+    def setup_logger_directory(self, directory):
+        """Setup logger to write to the specified directory. Only called when directory is selected."""
+        if directory is None or not directory:
+            return
+        
+        dir_path = Path(directory)
+        if not dir_path.exists():
+            return
+        
+        # Remove existing file handlers from the global logger (if any)
+        global logger
+        for handler in logger.handlers[:]:
+            if isinstance(handler, logging.FileHandler):
+                handler.close()
+                logger.removeHandler(handler)
+        
+        # Create new log file in the selected directory
+        current_datetime = datetime.datetime.now().strftime("_%Y%m%d_%H%M%S")
+        log_filename = 'caiman_runner' + current_datetime + '.log'
+        log_path = dir_path / log_filename
+        
+        # Add new file handler - this is when logging actually starts
+        handler = logging.FileHandler(log_path)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        
+        self.log(f'Logger initialized: {log_path}')
+    
     def select_directory(self):
         """Open dialog to select data directory."""
         directory = QtWidgets.QFileDialog.getExistingDirectory(
@@ -376,6 +435,9 @@ class CaimanRunner(QtWidgets.QDialog):
             self.data_path = Path(directory)
             self.params.child('Data Parameters', 'Data Directory').setValue(str(self.data_path))
             self.log(f'Selected directory: {self.data_path}')
+            
+            # Update logger to write to selected directory
+            self.setup_logger_directory(self.data_path)
             
             # Try to load metadata
             meta_path = self.data_path / 'metaData.json'
@@ -389,19 +451,21 @@ class CaimanRunner(QtWidgets.QDialog):
                 except Exception as e:
                     self.log(f'Could not load metadata: {e}')
             
-            # Check for AVI files and populate file list
-            avi_files = natsorted(self.data_path.glob('*.avi'))
-            if avi_files:
-                self.log(f'Found {len(avi_files)} AVI files')
-                self.populate_file_list(avi_files)
+            # Check for video files and populate file list
+            video_files = natsorted([str(f.resolve()) for f in self.data_path.glob('*.avi')])
+            if video_files:
+                self.log(f'Found {len(video_files)} video files')
+                self.populate_file_list(video_files)
                 # Load first video for preview
-                if avi_files:
-                    self.load_video_preview(avi_files[0])
+                if video_files:
+                    self.load_video_preview(video_files[0])
             else:
                 self.log('Warning: No AVI files found in directory')
                 self.file_list.clear()
                 self.run_btn.setEnabled(False)
                 self.preview_btn.setEnabled(False)
+                self.select_all_files_btn.setEnabled(False)
+                self.deselect_all_files_btn.setEnabled(False)
     
     def load_video_preview(self, video_path, max_frames=1000):
         """Load video frames for preview (limited to max_frames for performance)."""
@@ -439,15 +503,10 @@ class CaimanRunner(QtWidgets.QDialog):
             self.show_dff_check.setEnabled(True)
             self.gain_slider.setEnabled(True)
             
-            # Pre-calculate F0 baseline for dF/F (20th percentile) - PER PIXEL
-            # This calculates the 20th percentile along the time axis (axis=0),
-            # resulting in a 2D array (H, W) where each pixel has its own F0 baseline
-            self.log('Calculating baseline for dF/F...')
-            self.F0_baseline = np.percentile(self.video_frames, 20, axis=0)  # Shape: (H, W) - per pixel
-            self.F0_baseline = np.maximum(self.F0_baseline, 1e-6)
-            self.video_frames_dff = None  # Will be calculated on demand
-            self.display_cache = {}  # Clear cache
-            
+            self.log('Calculating F0...')
+            self.F0 = np.percentile(self.video_frames, 20, axis=0)
+            self.F0 = np.maximum(self.F0, 1e-6)
+
             # Calculate overall video statistics for fixed normalization
             self.log('Calculating video statistics...')
             self.video_min = np.percentile(self.video_frames, 1)
@@ -495,7 +554,7 @@ class CaimanRunner(QtWidgets.QDialog):
             self._syncing_min_pnr = False
     
     def update_frame_display(self):
-        """Update the displayed frame (original or dF/F) - optimized version."""
+        """Update the displayed frame (original or dF/F)"""
         if self.video_frames is None or len(self.video_frames) == 0:
             return
         
@@ -506,29 +565,18 @@ class CaimanRunner(QtWidgets.QDialog):
         if cache_key in self.display_cache:
             pixmap = self.display_cache[cache_key]
         else:
-            # Get frame (original or dF/F)
             if use_dff:
-                # Pre-calculate all dF/F frames if not already done
-                # dF/F is calculated per-pixel: (F - F0) / F0 for each pixel independently
-                if self.video_frames_dff is None:
-                    self.log('Pre-calculating dF/F...')
-                    self.video_frames_dff = 100 * (self.video_frames - self.F0_baseline) / self.F0_baseline # percent
-                
-                frame = self.video_frames_dff[self.current_frame_idx]
-                # Use fixed normalization range for dF/F
+                frame = 100 * (self.video_frames[self.current_frame_idx] - self.F0) / self.F0
                 frame_min = self.dff_min
                 frame_max = self.dff_max
             else:
                 frame = self.video_frames[self.current_frame_idx]
-                # Use fixed normalization range for original video
                 frame_min = self.video_min
                 frame_max = self.video_max
             
             # Apply gain
             frame = frame * self.gain
             
-            # Clip and normalize to 0-255 using fixed range (not per-frame min/max)
-            # This prevents outliers from affecting the whole frame
             frame_clipped = np.clip(frame, frame_min, frame_max)
             if frame_max > frame_min:
                 frame_norm = ((frame_clipped - frame_min) / (frame_max - frame_min) * 255).astype(np.uint8)
@@ -723,10 +771,10 @@ class CaimanRunner(QtWidgets.QDialog):
             self.log(f'Testing CNMF-E gSig parameter: {gSig}')
             
             # Load first 500 frames from first file
-            self.log(f'Loading first 500 frames from: {files[0].name}')
+            self.log(f'Loading first 500 frames from: {Path(files[0]).name}')
             import cv2
             
-            cap = cv2.VideoCapture(str(files[0]))
+            cap = cv2.VideoCapture(files[0])
             frames = []
             max_frames = 500
             
@@ -968,6 +1016,9 @@ class CaimanRunner(QtWidgets.QDialog):
         min_corr = self.params.child('CNMF-E Parameters', 'min_corr').value()
         min_pnr = self.params.child('CNMF-E Parameters', 'min_pnr').value()
         merge_thr = self.params.child('CNMF-E Parameters', 'merge_thr').value()
+        p = self.params.child('CNMF-E Parameters', 'p').value()
+        patch_size = self.params.child('CNMF-E Parameters', 'patch_size').value()
+        stride = self.params.child('CNMF-E Parameters', 'stride').value()
         
         # Calculate correlation and PNR images
         self.log('Calculating correlation and PNR images...')
@@ -1001,10 +1052,10 @@ class CaimanRunner(QtWidgets.QDialog):
                 'del_duplicates': True,
                 'low_rank_background': None,
                 'nb_patch': 0,
-                'rf': 48,
-                'stride': 8,
+                'rf': patch_size,
+                'stride': stride,
             },
-            'preprocess': {'p': 0},
+            'preprocess': {'p': p},
             'init': {
                 'K': None,
                 'center_psf': True,
@@ -1020,7 +1071,7 @@ class CaimanRunner(QtWidgets.QDialog):
                 'ssub': 1,
                 'ssub_B': 2,
             },
-            'temporal': {'p': 0},
+            'temporal': {'p': p},
             'merging': {'merge_thr': merge_thr}
         }
         
@@ -1045,7 +1096,7 @@ class CaimanRunner(QtWidgets.QDialog):
             'quality': {
                 'min_SNR': min_SNR,
                 'rval_thr': rval_thr,
-                'use_cnn': False
+                'use_cnn': True
             }
         }
         self.cnmfe_model.params.change_params(params_dict=quality_params)
@@ -1068,6 +1119,38 @@ class CaimanRunner(QtWidgets.QDialog):
         n_components = len(self.cnmfe_model.estimates.idx_components)
         self.log(f'Quality control completed. {n_components} components passed.')
     
+    def setup_logger_save_folder(self, save_folder):
+        """Setup logger to write to save folder location."""
+        if save_folder is None:
+            return
+        
+        save_path = Path(save_folder)
+        if not save_path.exists():
+            save_path.mkdir(parents=True, exist_ok=True)
+        
+        # Create logger for save folder
+        logger_name = 'caiman_runner_save'
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(logging.INFO)
+        
+        # Remove existing handlers to avoid duplicates
+        logger.handlers = []
+        
+        # Create log file in save folder
+        current_datetime = datetime.datetime.now().strftime("_%Y%m%d_%H%M%S")
+        log_filename = 'caiman_runner' + current_datetime + '.log'
+        log_path = save_path / log_filename
+        
+        # Add file handler
+        handler = logging.FileHandler(log_path)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        
+        self.save_logger = logger
+        logger.info(f'Logger initialized in save folder. Log file: {log_path}')
+        self.log(f'Logger set up in save folder: {log_path}')
+    
     def save_results(self, files_mc):
         """Save processing results."""
         # Create caiman output directory if it doesn't exist
@@ -1076,6 +1159,9 @@ class CaimanRunner(QtWidgets.QDialog):
         
         save_path = caiman_dir / f'{self.data_path.name}_data.hdf5'
         self.save_path = save_path  # Store for later use
+        
+        # Setup logger in save folder location
+        self.setup_logger_save_folder(caiman_dir)
         
         # Add correlation image if not available
         if not hasattr(self.cnmfe_model, 'cn_filter') or self.cnmfe_model.cn_filter is None:
@@ -1104,6 +1190,13 @@ class CaimanRunner(QtWidgets.QDialog):
         
         self.cnmfe_model.save(str(save_path))
         self.log(f'Results saved to: {save_path}')
+        
+        # Log to save folder logger if available
+        if hasattr(self, 'save_logger') and self.save_logger:
+            self.save_logger.info(f'Results saved to: {save_path}')
+            self.save_logger.info(f'Total components: {len(self.cnmfe_model.estimates.idx_components)}')
+            if hasattr(self.cnmfe_model.estimates, 'accepted_list'):
+                self.save_logger.info(f'Accepted components: {len(self.cnmfe_model.estimates.accepted_list)}')
 
 
 def caiman_runner_window(parent=None):
