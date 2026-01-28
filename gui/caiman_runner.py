@@ -316,6 +316,14 @@ class CaimanRunner(QtWidgets.QDialog):
                 {'name': 'rval_thr', 'type': 'float', 'value': 0.85, 'limits': (0, 1), 'step': 0.01,
                  'tip': 'Minimum spatial correlation (r-value) for accepting components. Measures how well the spatial footprint matches the data. Range: 0-1, higher is better.'},
             ]},
+            {'name': 'Detrend Parameters', 'type': 'group', 'children': [
+                {'name': 'quantileMin', 'type': 'float', 'value': 8.0, 'limits': (0, 100),
+                 'tip': 'Quantile used to estimate the baseline (values in [0,100]). Used for DF/F normalization.'},
+                {'name': 'frames_window', 'type': 'int', 'value': 500, 'limits': (1, 10000),
+                 'tip': 'Number of frames for computing running quantile. Larger windows provide smoother baselines but are slower.'},
+                {'name': 'use_residuals', 'type': 'bool', 'value': True,
+                 'tip': 'Flag for using non-deconvolved traces (C + YrA) in DF/F calculation.'},
+            ]},
         ]
         self.params = Parameter.create(name='params', type='group', children=params)
         self.param_tree.setParameters(self.params, showTop=False)
@@ -1109,11 +1117,14 @@ class CaimanRunner(QtWidgets.QDialog):
         
         if self.cnmfe_model.estimates.F_dff is None:
             self.log('Calculating F_dff...')
+            quantileMin = self.params.child('Detrend Parameters', 'quantileMin').value()
+            frames_window = self.params.child('Detrend Parameters', 'frames_window').value()
+            use_residuals = self.params.child('Detrend Parameters', 'use_residuals').value()
+            
             self.cnmfe_model.estimates.detrend_df_f(
-                quantileMin=8,
-                frames_window=250,
-                flag_auto=False,
-                use_residuals=False
+                quantileMin=quantileMin,
+                frames_window=frames_window,
+                use_residuals=use_residuals,
             )
         
         n_components = len(self.cnmfe_model.estimates.idx_components)
