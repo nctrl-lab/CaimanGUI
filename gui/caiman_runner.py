@@ -36,11 +36,6 @@ class CaimanRunner(QtWidgets.QDialog):
         self.setWindowTitle('CaImAn Processing Runner')
         self.resize(1200, 700)
         
-        # Icon
-        icon_path = os.path.join(os.path.dirname(__file__), '..', 'images', 'Caiman_logo_2.png')
-        if os.path.exists(icon_path):
-            self.setWindowIcon(QtGui.QIcon(icon_path))
-        
         self.data_path = None
         self.cluster = None
         self.n_processes = 8

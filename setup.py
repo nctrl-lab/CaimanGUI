@@ -55,6 +55,6 @@ setup(
     ],
     include_package_data=True,
     package_data={
-        'gui': ['config_nwb.json'],
+        'gui': ['config_nwb.json', '*.png'],
     },
 )

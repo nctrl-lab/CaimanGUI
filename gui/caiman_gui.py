@@ -17,6 +17,7 @@ import json
 import logging
 import datetime
 from pathlib import Path
+import importlib.resources
 import cv2
 import numpy as np
 import pyqtgraph as pg
@@ -41,11 +42,15 @@ class MainWindow(QtWidgets.QMainWindow):
         super(MainWindow, self).__init__()
         self.resize(1400,1000)
         self.setWindowTitle('Caiman GUI Lite for 1-photon data')
-        
-        # Icon
-        icon_path = os.path.join(os.path.dirname(__file__), '..', 'images', 'Caiman_logo_2.png')
-        if os.path.exists(icon_path):
-            self.setWindowIcon(QtGui.QIcon(icon_path))
+
+        try:
+            with importlib.resources.as_file(
+                importlib.resources.files(__package__).joinpath('Caiman_logo_2.png')
+            ) as icon_path:
+                if icon_path.is_file():
+                    self.setWindowIcon(QtGui.QIcon(str(icon_path)))
+        except Exception:
+            pass
         
         self.statusBar().showMessage('Ready')
         
