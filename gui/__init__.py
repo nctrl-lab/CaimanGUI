@@ -3,4 +3,4 @@
 CaImAnGUI - A graphical user interface for visualizing CaImAn processed imaging data.
 """
 
-__version__ = '1.1.1'
+__version__ = '1.1.2'

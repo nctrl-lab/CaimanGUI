@@ -15,7 +15,7 @@ if os.path.exists(readme_path):
 
 setup(
     name='caimangui',
-    version='1.1.1',
+    version='1.1.2',
     description='A graphical user interface for visualizing CaImAn processed imaging data',
     long_description=long_description,
     long_description_content_type='text/markdown',
