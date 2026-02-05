@@ -4,8 +4,8 @@ A graphical user interface for visualizing CaImAn processed imaging data.
 [CaImAn](https://github.com/flatironinstitute/CaImAn) is a powerful computational software to process one-photon and two-photon imaging data. Here, CaimanGUI provides complementary visulizing functionalities that help neuroscientists to curate their processed imaging data.
 
 ## Installation
-Follow the instructions for installing CaInAm [here](https://github.com/flatironinstitute/CaImAn/blob/main/docs/source/Installation.rst). Then, you can download the CaimanGUI source codes or
 ```
+conda create -n caiman caiman
 conda activate caiman
 pip install git+https://github.com/nctrl-lab/CaimanGUI
 ```

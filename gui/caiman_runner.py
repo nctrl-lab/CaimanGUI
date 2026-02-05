@@ -11,6 +11,7 @@ import logging
 import datetime
 from pathlib import Path
 from natsort import natsorted
+import psutil
 
 import numpy as np
 import pyqtgraph as pg
@@ -18,7 +19,7 @@ from pyqtgraph.Qt import QtGui, QtCore, QtWidgets
 from pyqtgraph.parametertree import Parameter, ParameterTree
 
 import caiman as cm
-from caiman.motion_correction import MotionCorrect
+from caiman.motion_correction import MotionCorrect, high_pass_filter_space
 from caiman.source_extraction import cnmf
 from caiman.source_extraction.cnmf.cnmf import load_CNMF
 from caiman.utils.visualization import nb_inspect_correlation_pnr
@@ -37,6 +38,8 @@ class CaimanRunner(QtWidgets.QDialog):
         self.resize(1200, 700)
         
         self.data_path = None
+        self.caiman_path = None
+        self.base_name = ''
         self.cluster = None
         self.n_processes = 8
         self.cnmfe_model = None
@@ -58,6 +61,9 @@ class CaimanRunner(QtWidgets.QDialog):
         self._syncing_min_pnr = False  # Flag to prevent infinite sync loops
         self.selected_files = []  # List of selected file paths
         self.save_logger = None  # Logger instance for save folder
+        self._preview_video_path = None  # Path for preview (load full video on Play)
+        self._frame_count = 0  # Total frames (from file)
+        self._first_frame = None  # Single frame for display when video not loaded
         
         # Main horizontal layout (left panel + right panel)
         main_layout = QtWidgets.QHBoxLayout()
@@ -147,10 +153,12 @@ class CaimanRunner(QtWidgets.QDialog):
         self.play_btn = QtWidgets.QPushButton('Play')
         self.play_btn.clicked.connect(self.toggle_play)
         self.play_btn.setEnabled(False)
+        self.play_btn.setMaximumWidth(60)
         
         self.stop_btn = QtWidgets.QPushButton('Stop')
         self.stop_btn.clicked.connect(self.stop_video)
         self.stop_btn.setEnabled(False)
+        self.stop_btn.setMaximumWidth(60)
         
         self.frame_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.frame_slider.setMinimum(0)
@@ -163,6 +171,11 @@ class CaimanRunner(QtWidgets.QDialog):
         self.show_dff_check = QtWidgets.QCheckBox('Show dF/F')
         self.show_dff_check.setEnabled(False)
         self.show_dff_check.stateChanged.connect(self.update_frame_display)
+
+        # Checkbox to apply gSig_filt (high-pass filter) to correlation/PNR images
+        self.apply_gsig_filt_check = QtWidgets.QCheckBox('Apply gSig_filt')
+        self.apply_gsig_filt_check.setToolTip('High-pass filter correlation and PNR images using Motion Correction gSig_filt')
+        self.apply_gsig_filt_check.stateChanged.connect(self.update_frame_display)
         
         # Gain slider
         gain_label = QtWidgets.QLabel('Gain:')
@@ -184,6 +197,7 @@ class CaimanRunner(QtWidgets.QDialog):
         controls_layout.addWidget(self.frame_slider)
         controls_layout.addWidget(self.frame_label)
         controls_layout.addWidget(self.show_dff_check)
+        controls_layout.addWidget(self.apply_gsig_filt_check)
         controls_layout.addWidget(gain_label)
         controls_layout.addWidget(self.gain_slider)
         controls_layout.addWidget(self.gain_value_label)
@@ -272,6 +286,8 @@ class CaimanRunner(QtWidgets.QDialog):
             {'name': 'Data Parameters', 'type': 'group', 'children': [
                 {'name': 'Data Directory', 'type': 'str', 'value': '', 'readonly': True,
                  'tip': 'Directory containing video files (.avi) to process'},
+                {'name': 'Base Name', 'type': 'str', 'value': '',
+                 'tip': 'Base name for output files (memmap, HDF5). If empty, uses the data directory name.'},
                 {'name': 'Frame Rate (Hz)', 'type': 'float', 'value': 20.0,
                  'tip': 'Acquisition frame rate in Hz (frames per second). Used for temporal analysis and deconvolution.'},
                 {'name': 'Decay Time', 'type': 'float', 'value': 0.4,
@@ -282,7 +298,7 @@ class CaimanRunner(QtWidgets.QDialog):
                  'tip': 'Number of parallel processes for computation. Higher values speed up processing but use more CPU/memory.'},
             ]},
             {'name': 'Motion Correction', 'type': 'group', 'children': [
-                {'name': 'gSig_filt', 'type': 'int', 'value': 6, 'limits': (1, 33),
+                {'name': 'gSig_filt', 'type': 'int', 'value': 5, 'limits': (1, 33),
                  'tip': 'Size of Gaussian kernel for spatial filtering before motion correction (in pixels).'},
                 {'name': 'max_shifts', 'type': 'int', 'value': 20,
                  'tip': 'Maximum allowed shift in pixels for motion correction. Increase if there is significant motion in the video.'},
@@ -316,13 +332,13 @@ class CaimanRunner(QtWidgets.QDialog):
                  'tip': 'Quantile used to estimate the baseline (values in [0,100]). Used for DF/F normalization.'},
                 {'name': 'frames_window', 'type': 'int', 'value': 500, 'limits': (1, 10000),
                  'tip': 'Number of frames for computing running quantile. Larger windows provide smoother baselines but are slower.'},
-                {'name': 'use_residuals', 'type': 'bool', 'value': True,
+                {'name': 'use_residuals', 'type': 'bool', 'value': False,
                  'tip': 'Flag for using non-deconvolved traces (C + YrA) in DF/F calculation.'},
             ]},
         ]
         self.params = Parameter.create(name='params', type='group', children=params)
         self.param_tree.setParameters(self.params, showTop=False)
-        
+
         # Connect parameter changes to sync with sliders (bidirectional sync for min_corr and min_pnr)
         self.params.child('CNMF-E Parameters', 'min_corr').sigValueChanged.connect(
             lambda param, value: self._sync_min_corr_from_param(value)
@@ -398,6 +414,9 @@ class CaimanRunner(QtWidgets.QDialog):
     
     def log(self, message):
         """Add message to progress log."""
+        print(message)
+        if self.save_logger is not None:
+            self.save_logger.info(message)
         self.progress_text.append(message)
         QtWidgets.QApplication.processEvents()
     
@@ -436,11 +455,19 @@ class CaimanRunner(QtWidgets.QDialog):
             self, 'Select Data Directory', '')
         if directory:
             self.data_path = Path(directory)
+            self.caiman_path = self.data_path / 'caiman'
+            self.caiman_path.mkdir(parents=True, exist_ok=True)
+            os.environ['CAIMAN_TEMP'] = str(self.caiman_path)
+
+            base_val = self.params.child('Data Parameters', 'Base Name').value().strip()
+            self.base_name = base_val if base_val else self.data_path.name 
+            self.params.child('Data Parameters', 'Base Name').setValue(self.base_name)
+
             self.params.child('Data Parameters', 'Data Directory').setValue(str(self.data_path))
-            self.log(f'Selected directory: {self.data_path}')
             
             # Update logger to write to selected directory
-            self.setup_logger_directory(self.data_path)
+            self.setup_logger_directory(self.caiman_path)
+            self.log(f'Selected directory: {self.data_path}')
             
             # Try to load metadata
             meta_path = self.data_path / 'metaData.json'
@@ -471,34 +498,40 @@ class CaimanRunner(QtWidgets.QDialog):
                 self.deselect_all_files_btn.setEnabled(False)
     
     def load_video_preview(self, video_path, max_frames=1000):
-        """Load video frames for preview (limited to max_frames for performance)."""
+        """Load only metadata and first frame for preview; full video loads when Play is pushed."""
         try:
             import cv2
             self.log(f'Loading video preview: {Path(video_path).name}')
             
             cap = cv2.VideoCapture(str(video_path))
-            frames = []
-            frame_count = 0
-            
-            while frame_count < max_frames:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                # Convert to grayscale if needed
-                if len(frame.shape) == 3:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                frames.append(frame.astype(np.float32))
-                frame_count += 1
-            
-            cap.release()
-            
-            if len(frames) == 0:
-                self.video_label.setText('Could not load video frames')
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if frame_count <= 0:
+                cap.release()
+                self.video_label.setText('Could not get frame count')
                 return
             
-            self.video_frames = np.array(frames)
+            # Load only first frame for display until Play is pushed
+            ret, frame = cap.read()
+            cap.release()
+            if not ret:
+                self.video_label.setText('Could not load first frame')
+                return
+            
+            if len(frame.shape) == 3:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            self._first_frame = frame.astype(np.float32)
+            self._preview_video_path = str(video_path)
+            self._frame_count = min(frame_count, max_frames)  # cap for loading on Play
+            
+            self.video_frames = None  # Full video loads on Play
+            self.F0 = None
+            self.video_min = None
+            self.video_max = None
+            self.dff_min = None
+            self.dff_max = None
+            self.display_cache = {}
             self.current_frame_idx = 0
-            self.frame_slider.setMaximum(len(self.video_frames) - 1)
+            self.frame_slider.setMaximum(self._frame_count - 1)
             self.frame_slider.setValue(0)
             self.frame_slider.setEnabled(True)
             self.play_btn.setEnabled(True)
@@ -506,23 +539,46 @@ class CaimanRunner(QtWidgets.QDialog):
             self.show_dff_check.setEnabled(True)
             self.gain_slider.setEnabled(True)
             
+            self.update_frame_display()
+            self.log(f'Preview ready: {self._frame_count} frames (press Play to load video)')
+            
+        except Exception as e:
+            self.log(f'Error loading video: {str(e)}')
+            self.video_label.setText(f'Error loading video: {str(e)}')
+    
+    def _load_full_video(self):
+        """Load full video from _preview_video_path and compute F0, min, max (called on Play)."""
+        if not self._preview_video_path or self._frame_count <= 0:
+            return
+        try:
+            import cv2
+            self.log('Loading video...')
+            cap = cv2.VideoCapture(self._preview_video_path)
+            frames = []
+            for _ in range(self._frame_count):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if len(frame.shape) == 3:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                frames.append(frame.astype(np.float32))
+            cap.release()
+            if len(frames) == 0:
+                self.log('Could not load any frames')
+                return
+            self.video_frames = np.array(frames)
             self.log('Calculating F0...')
             self.F0 = np.percentile(self.video_frames, 20, axis=0)
             self.F0 = np.maximum(self.F0, 1e-6)
-
-            # Calculate overall video statistics for fixed normalization
             self.log('Calculating video statistics...')
             self.video_min = np.percentile(self.video_frames, 1)
             self.video_max = np.percentile(self.video_frames, 99.5)
             self.dff_min = 0
             self.dff_max = 100
-            
-            self.update_frame_display()
-            self.log(f'Loaded {len(self.video_frames)} frames for preview')
-            
+            self.display_cache = {}
+            self.log(f'Loaded {len(self.video_frames)} frames')
         except Exception as e:
             self.log(f'Error loading video: {str(e)}')
-            self.video_label.setText(f'Error loading video: {str(e)}')
     
     def gain_changed(self, value):
         """Handle gain slider change."""
@@ -557,12 +613,36 @@ class CaimanRunner(QtWidgets.QDialog):
             self._syncing_min_pnr = False
     
     def update_frame_display(self):
-        """Update the displayed frame (original or dF/F)"""
+        """Update the displayed frame (original or dF/F). When video not loaded, show _first_frame."""
+        # When full video not loaded, show first frame only (no F0/dF/F)
         if self.video_frames is None or len(self.video_frames) == 0:
+            if self._first_frame is not None:
+                frame = self._first_frame * self.gain
+
+                if self.apply_gsig_filt_check.isChecked():
+                    gSig_filt = self.params.child('Motion Correction', 'gSig_filt').value()
+                    frame = high_pass_filter_space(frame, gSig_filt=(gSig_filt, gSig_filt))
+
+                frame_min = np.percentile(frame, 1)
+                frame_max = np.percentile(frame, 99.5)
+                frame_clipped = np.clip(frame, frame_min, frame_max)
+                if frame_max > frame_min:
+                    frame_norm = ((frame_clipped - frame_min) / (frame_max - frame_min) * 255).astype(np.uint8)
+                else:
+                    frame_norm = np.clip(frame_clipped, 0, 255).astype(np.uint8)
+                height, width = frame_norm.shape
+                q_image = QtGui.QImage(frame_norm.data, width, height, width, QtGui.QImage.Format_Grayscale8)
+                pixmap = QtGui.QPixmap.fromImage(q_image)
+                label_size = self.video_label.size()
+                scaled_pixmap = pixmap.scaled(label_size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                self.video_label.setPixmap(scaled_pixmap)
+                n = self._frame_count
+                self.frame_label.setText(f'Frame: {self.current_frame_idx + 1}/{n} (press Play to load)')
             return
         
         use_dff = self.show_dff_check.isChecked()
-        cache_key = (self.current_frame_idx, use_dff, self.gain)
+        apply_gsig_filt = self.apply_gsig_filt_check.isChecked()
+        cache_key = (self.current_frame_idx, use_dff, self.gain, apply_gsig_filt)
         
         # Check cache first
         if cache_key in self.display_cache:
@@ -579,6 +659,12 @@ class CaimanRunner(QtWidgets.QDialog):
             
             # Apply gain
             frame = frame * self.gain
+
+            if apply_gsig_filt:
+                gSig_filt = self.params.child('Motion Correction', 'gSig_filt').value()
+                frame = high_pass_filter_space(frame, gSig_filt=(gSig_filt, gSig_filt))
+                frame_min = np.percentile(frame, 1)
+                frame_max = np.percentile(frame, 99.5)
             
             frame_clipped = np.clip(frame, frame_min, frame_max)
             if frame_max > frame_min:
@@ -616,10 +702,14 @@ class CaimanRunner(QtWidgets.QDialog):
         self.frame_label.setText(f'Frame: {self.current_frame_idx + 1}/{len(self.video_frames)}')
     
     def toggle_play(self):
-        """Toggle video playback."""
-        if self.video_frames is None:
+        """Toggle video playback. Load full video and compute F0/min/max on first Play."""
+        if self._preview_video_path is None:
             return
-        
+        # Load video only when Play is pushed (and compute F0, min, max)
+        if self.video_frames is None:
+            self._load_full_video()
+            if self.video_frames is None:
+                return
         if self.is_playing:
             self.timer.stop()
             self.is_playing = False
@@ -632,19 +722,34 @@ class CaimanRunner(QtWidgets.QDialog):
             self.play_btn.setText('Pause')
     
     def stop_video(self):
-        """Stop video playback and reset to first frame."""
+        """Stop video playback, clear loaded variables to save memory, reset to first frame."""
         self.timer.stop()
         self.is_playing = False
         self.play_btn.setText('Play')
         self.current_frame_idx = 0
         self.frame_slider.setValue(0)
+        # Clear loaded variables to free memory
+        self.video_frames = None
+        self.video_frames_dff = None
+        self.F0 = None
+        self.F0_baseline = None
+        self.video_min = None
+        self.video_max = None
+        self.dff_min = None
+        self.dff_max = None
+        self.display_cache = {}
         self.update_frame_display()
     
     def clear_video_cache(self):
         """Clear video-related caches."""
         self.video_frames = None
         self.video_frames_dff = None
+        self.F0 = None
         self.F0_baseline = None
+        self.video_min = None
+        self.video_max = None
+        self.dff_min = None
+        self.dff_max = None
         self.display_cache = {}
     
     def next_frame(self):
@@ -661,9 +766,6 @@ class CaimanRunner(QtWidgets.QDialog):
     
     def slider_changed(self, value):
         """Handle slider value change."""
-        if self.video_frames is None:
-            return
-        
         self.current_frame_idx = value
         self.update_frame_display()
     
@@ -698,14 +800,15 @@ class CaimanRunner(QtWidgets.QDialog):
     def update_image_plots(self):
         """Update correlation and PNR image plots with thresholding."""
         if self.correlation_image is not None:
+            corr_img = self.correlation_image
             # Get threshold from parameter tree
             min_corr = self.params.child('CNMF-E Parameters', 'min_corr').value()
             # Create thresholded image: pixels below threshold are shown in red/black
-            corr_mask = self.correlation_image < min_corr
+            corr_mask = corr_img < min_corr
             
             # Clip correlation image to slider range [0, 1.0] and scale to 0-255
             corr_max = 1.0  # Slider range is 0-100 representing 0.00-1.00
-            corr_clipped = np.clip(self.correlation_image, 0, corr_max)
+            corr_clipped = np.clip(corr_img, 0, corr_max)
             corr_uint8 = (corr_clipped / corr_max * 255).astype(np.uint8)
             
             # Create RGB image: thresholded pixels in red, others in grayscale
@@ -724,14 +827,15 @@ class CaimanRunner(QtWidgets.QDialog):
             self.corr_plot.setTitle(f'Correlation Image (gSig={gSig}, min_corr={min_corr:.2f})')
         
         if self.peak_to_noise_ratio is not None:
+            pnr_img = self.peak_to_noise_ratio
             # Get threshold from parameter tree
             min_pnr = self.params.child('CNMF-E Parameters', 'min_pnr').value()
             # Create thresholded image: pixels below threshold are shown in red/black
-            pnr_mask = self.peak_to_noise_ratio < min_pnr
+            pnr_mask = pnr_img < min_pnr
             
             # Clip PNR image to slider range [0, 20.0] and scale to 0-255
             pnr_max = 20.0  # Slider range is 0-200 representing 0.0-20.0
-            pnr_clipped = np.clip(self.peak_to_noise_ratio, 0, pnr_max)
+            pnr_clipped = np.clip(pnr_img, 0, pnr_max)
             pnr_uint8 = (pnr_clipped / pnr_max * 255).astype(np.uint8)
             
             # Create RGB image: thresholded pixels in red, others in grayscale
@@ -907,18 +1011,16 @@ class CaimanRunner(QtWidgets.QDialog):
             self.log(f'Total duration: {duration_str} ({total_duration:.2f} seconds)')
             self.log('='*50)
             
-            # Get save path from save_results (stored as self.save_path)
-            save_path = self.save_path
             QtWidgets.QMessageBox.information(
                 self, 'Success', 
-                f'Processing completed!\nDuration: {duration_str}\n\nResults saved to:\n{save_path}')
+                f'Processing completed!\nDuration: {duration_str}\n\nResults saved to:\n{self.caiman_path}')
             
             # Automatically load the saved file in the main GUI if parent is MainWindow
             parent = self.parent()
             if parent is not None and hasattr(parent, 'load_data'):
                 try:
-                    self.log(f'\nLoading saved file in main GUI: {save_path}')
-                    parent.load_data(click=False, filepath=str(save_path))
+                    self.log(f'\nLoading saved file in main GUI: {self.save_path}')
+                    parent.load_data(click=False, filepath=str(self.save_path))
                     self.log('File loaded successfully in main GUI')
                 except Exception as e:
                     self.log(f'Warning: Could not auto-load file in main GUI: {str(e)}')
@@ -946,7 +1048,29 @@ class CaimanRunner(QtWidgets.QDialog):
         """Setup multiprocessing cluster."""
         n_processes = self.params.child('Cluster Parameters', 'Number of Processes').value()
         self.n_processes = n_processes
-        
+
+        # check available cores
+        available_cores = os.cpu_count()
+        if n_processes > available_cores:
+            n_processes = available_cores - 1
+            self.params.child('Cluster Parameters', 'Number of Processes').setValue(n_processes)
+            self.log(f'Number of processes set to {n_processes} (available cores: {available_cores}')
+
+        # check available memory
+        available_memory = psutil.virtual_memory().available / 1024**3  # in GB, use free/available memory
+        patch_size = self.params.child('CNMF-E Parameters', 'patch_size').value()
+        stride = self.params.child('CNMF-E Parameters', 'stride').value()
+        _, T = cm.base.movies.get_file_size(self.selected_files)
+        memory_usage_per_process = 2 * 4 * sum(T) * (patch_size + stride)**2 / 1024**3 # in GB
+        n_process_max = int(np.floor(available_memory / memory_usage_per_process)) - 1
+        self.log(f"Available memory: {available_memory:.2f} GB")
+        self.log(f"Memory usage per process: {memory_usage_per_process:.2f} GB")
+        self.log(f"Max number of processes: {n_process_max} (based on available memory)")
+        if n_processes > n_process_max:
+            self.log(f"Available memory is too low for {n_processes} processes. Setting to {n_process_max} processes.")
+            n_processes = n_process_max
+            self.params.child('Cluster Parameters', 'Number of Processes').setValue(n_processes)
+
         if self.cluster is not None:
             cm.stop_server(dview=self.cluster)
         
@@ -996,10 +1120,17 @@ class CaimanRunner(QtWidgets.QDialog):
         )
         mot_correct.motion_correct(save_movie=True)
         
-        # Save memory-mapped file
+        # Save rigid shifts as npy
+        base_val = self.params.child('Data Parameters', 'Base Name').value()
+        base = (base_val or '').strip() if base_val else ''
+        base = base or self.data_path.name
+        shifts_path = self.caiman_path / f'{base}_shifts_rig.npy'
+        np.save(shifts_path, mot_correct.shifts_rig)
+        self.log(f'Saved rigid shifts to {shifts_path}')
+        
         files_mc = cm.save_memmap(
             mot_correct.fname_tot_rig,
-            base_name=f'{self.data_path.name}_',
+            base_name=str(self.caiman_path / (self.base_name + '_')),
             order='C',
             border_to_0=0
         )
@@ -1154,21 +1285,13 @@ class CaimanRunner(QtWidgets.QDialog):
         logger.addHandler(handler)
         
         self.save_logger = logger
-        logger.info(f'Logger initialized in save folder. Log file: {log_path}')
         self.log(f'Logger set up in save folder: {log_path}')
     
     def save_results(self, files_mc):
         """Save processing results."""
-        # Create caiman output directory if it doesn't exist
-        caiman_dir = self.data_path / 'caiman'
-        caiman_dir.mkdir(exist_ok=True)
-        
-        save_path = caiman_dir / f'{self.data_path.name}_data.hdf5'
-        self.save_path = save_path  # Store for later use
-        
-        # Setup logger in save folder location
-        self.setup_logger_save_folder(caiman_dir)
-        
+        save_path = self.caiman_path / f'{self.base_name}_data.hdf5'
+        self.save_path = save_path
+
         # Add correlation image if not available
         if not hasattr(self.cnmfe_model, 'cn_filter') or self.cnmfe_model.cn_filter is None:
             if hasattr(self, 'correlation_image') and hasattr(self, 'peak_to_noise_ratio') and hasattr(self, 'image_max') and hasattr(self, 'image_mean') and hasattr(self, 'image_std'):
@@ -1196,13 +1319,7 @@ class CaimanRunner(QtWidgets.QDialog):
         
         self.cnmfe_model.save(str(save_path))
         self.log(f'Results saved to: {save_path}')
-        
-        # Log to save folder logger if available
-        if hasattr(self, 'save_logger') and self.save_logger:
-            self.save_logger.info(f'Results saved to: {save_path}')
-            self.save_logger.info(f'Total components: {len(self.cnmfe_model.estimates.idx_components)}')
-            if hasattr(self.cnmfe_model.estimates, 'accepted_list'):
-                self.save_logger.info(f'Accepted components: {len(self.cnmfe_model.estimates.accepted_list)}')
+        self.log(f'Total components: {len(self.cnmfe_model.estimates.idx_components)}')
 
 
 def caiman_runner_window(parent=None):

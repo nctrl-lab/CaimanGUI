@@ -32,7 +32,7 @@ import matplotlib.colors as mcolors
 from caiman.source_extraction.cnmf.cnmf import load_CNMF
 from caiman.source_extraction.cnmf.deconvolution import constrained_foopsi
 
-from .memap_player import memap_window
+from .memap_player import memap_window, find_mmap_files
 from .caiman_runner import caiman_runner_window
 
 pg.setConfigOptions(imageAxisOrder='row-major')
@@ -305,7 +305,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage('Loading '+self.fname)
         except Exception:
             self.statusBar().showMessage('Loading '+self.fname+' failed. Try other file...')
-        
+
+        # List available F-order mmap files in the same directory for the Movie player
+        if self.loaded:
+            self.available_mmap_files = find_mmap_files(os.path.dirname(self.fname))
+        else:
+            self.available_mmap_files = []
+
         if self.loaded:
             dims = self.cnmf.estimates.dims  # (y,x)
             estimates = self.cnmf.estimates

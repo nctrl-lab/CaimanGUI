@@ -1,8 +1,16 @@
-# -*- coding: utf-8 -*-
 """
-Window displaying motion-corrected movie (F-order memap file).
-When called from the parent GUI, time series (motion shift and fluorescence of the selected component)
-can be shown jointly with the vertical line indicating the current frame.
+Window displaying motion-corrected movie (F-order mmap file).
+When opened from the parent GUI with an HDF file loaded, available F-order mmap
+files in the same directory are listed.
+- Video modes:
+    1) Raw video
+    2) dF/F 
+        - F is calculated from moving median
+    3) Background-subtracted video
+        - Y - b0 - Bf
+        - = Y - b0 - W * (Y - AC - b0))
+- Options:
+    - Show neuron contours
 
 @author: Hung-Ling
 """
@@ -12,92 +20,133 @@ import numpy as np
 import cv2
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtGui, QtCore, QtWidgets
+from natsort import natsorted
+from caiman.mmapping import load_memmap
 
 pg.setConfigOptions(imageAxisOrder='row-major')
 
-# %%
+
+def find_mmap_files(directory, order='F'):
+    """
+    Scan a directory for .mmap files whose filename indicates F-order
+    (CaImAn convention: ..._d1_X_d2_Y_d3_Z_order_F_frames_T.mmap).
+
+    Returns
+    -------
+    list of str
+        Full paths of F-order mmap files.
+    """
+    if not directory or not os.path.isdir(directory):
+        return []
+
+    result = []
+    for name in os.listdir(directory):
+        if not name.lower().endswith('.mmap'):
+            continue
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            filename = os.path.splitext(name)[0]
+            fpart = filename.split('_')
+            if len(fpart) < 9:
+                continue
+            if fpart[-3].upper() == order:
+                result.append(path)
+        except (IndexError, ValueError):
+            continue
+    return natsorted(result)
+
+
 class MemapPlayer(QtWidgets.QMainWindow):
+    VIDEO_RAW = 'Raw'
+    VIDEO_DFF = 'dF/F'
+    VIDEO_BGSUB = 'Background subtracted'
+
     def __init__(self, parent=None):
         super(MemapPlayer, self).__init__(parent)
-        self.resize(800,800)  # width, height
-        self.setWindowTitle('View registered frames')
+        self.resize(800, 800)
+        self.setWindowTitle('Movie player')
         self.layout = QtWidgets.QGridLayout()
         cw = QtWidgets.QWidget()
         cw.setLayout(self.layout)
         self.setCentralWidget(cw)
-        ## -------- Some internal variables/parameters -----------------------
+
         self.loaded = False
-        self.cframe = 0  # Current frame index
-        self.fps = 20.0  # Frame per second
-        self.dt = 1  # Temporal binning
-        self.sigma = 0  # Highpass Gaussian filter size (0 for original frames)
-        self.medSize = 1  # Apply median filter
-        self.prct = [1, 99.9]  # Percentile for stretching the contrast
-        self.dframe = 10  # Number of frames to jump using left/right keys
+        self.cframe = 0
+        self.fps = 20.0
+        self.prct = [1, 99.9]
+        self.dframe = 10
         self.this_cell = -1
-        ## -------- Button to open memap file --------------------------------
-        openButton = QtWidgets.QPushButton('OPEN')
+        self.Yr = None
+        self.dims = None
+        self.nframe = 0
+        self._dff_baseline = None
+        self._video_mode = self.VIDEO_RAW
+
+        # -------- Mmap file selection (dropdown + OPEN) --------
+        self.layout.addWidget(QtWidgets.QLabel('Files:'), 0, 0, 1, 1)
+        self.mmapCombo = QtWidgets.QComboBox()
+        self.mmapCombo.setMinimumWidth(200)
+        self.mmapCombo.currentIndexChanged.connect(self.on_mmap_combo_changed)
+        self.layout.addWidget(self.mmapCombo, 0, 1, 1, 4)
+        openButton = QtWidgets.QPushButton('OPEN...')
         openButton.setShortcut(QtGui.QKeySequence("Ctrl+O"))
-        self.fileLabel = QtWidgets.QLabel('No file chosen')
-        self.layout.addWidget(openButton,0,0,1,2)  # i-row, j-col, nrow, ncol
-        self.layout.addWidget(self.fileLabel,0,2,1,14)
         openButton.clicked.connect(self.open_memap)
-        ## -------- Parameters -----------------------------------------------
-        rateLabel = QtWidgets.QLabel('Frame rate:')
-        self.layout.addWidget(rateLabel,1,2,1,1)
+        self.layout.addWidget(openButton, 0, 5, 1, 1)
+        self.fileLabel = QtWidgets.QLabel('No file loaded...')
+        self.layout.addWidget(self.fileLabel, 0, 6, 1, 10)
+
+        # Populate mmap combo from parent if available (load first file after all widgets exist)
+        self._parent = parent
+        if parent is not None and getattr(parent, 'available_mmap_files', None):
+            for path in parent.available_mmap_files:
+                self.mmapCombo.addItem(os.path.basename(path), path)
+            if self.mmapCombo.count() > 0:
+                self.mmapCombo.setCurrentIndex(0)
+
+        # -------- Video mode: Raw / dF/F / Background subtracted --------
+        self.layout.addWidget(QtWidgets.QLabel('Video:'), 1, 0, 1, 1)
+        self.videoModeCombo = QtWidgets.QComboBox()
+        self.videoModeCombo.addItems([self.VIDEO_RAW, self.VIDEO_DFF, self.VIDEO_BGSUB])
+        self.videoModeCombo.currentTextChanged.connect(self.on_video_mode_changed)
+        self.layout.addWidget(self.videoModeCombo, 1, 1, 1, 2)
+
+        # -------- Save as video --------
+        self.saveVideoButton = QtWidgets.QPushButton('Save as video...')
+        self.saveVideoButton.clicked.connect(self.save_as_video)
+        self.saveVideoButton.setEnabled(False)
+        self.layout.addWidget(self.saveVideoButton, 1, 3, 1, 2)
+
+        # -------- Show contours --------
+        self.showContoursCheck = QtWidgets.QCheckBox('Show contours')
+        self.showContoursCheck.stateChanged.connect(self.on_show_contours_changed)
+        self.layout.addWidget(self.showContoursCheck, 1, 5, 1, 1)
+        self.layout.addWidget(QtWidgets.QLabel('Component:'), 1, 6, 1, 1)
+        self.component = QtWidgets.QSpinBox()
+        self.component.setRange(-1, 9999)
+        self.component.setValue(-1)
+        self.component.setSpecialValueText('None')
+        self.component.valueChanged.connect(self.change_params)
+        self.layout.addWidget(self.component, 1, 7, 1, 1)
+
+        # -------- Frame rate --------
+        self.layout.addWidget(QtWidgets.QLabel('Frame rate:'), 1, 8, 1, 1)
         self.rate = QtWidgets.QLineEdit()
         self.rate.setFixedWidth(50)
-        self.rate.setAlignment(QtCore.Qt.AlignCenter)  # AlignRight
+        self.rate.setAlignment(QtCore.Qt.AlignCenter)
         self.rate.setText(str(self.fps))
         self.rate.textChanged.connect(self.change_params)
-        self.layout.addWidget(self.rate,1,3,1,1)
-        self.layout.addItem(QtWidgets.QSpacerItem(10,20),1,4,1,1)  # Horizontal spacer
-        binLabel = QtWidgets.QLabel('Frame binning:')
-        self.layout.addWidget(binLabel,1,5,1,1)
-        self.binning = QtWidgets.QLineEdit()
-        self.binning.setValidator(QtGui.QIntValidator(1,100))
-        self.binning.setFixedWidth(30)
-        self.binning.setAlignment(QtCore.Qt.AlignCenter)  # AlignRight
-        self.binning.setText(str(self.dt))
-        self.binning.textChanged.connect(self.change_params)
-        self.layout.addWidget(self.binning,1,6,1,1)
-        self.layout.addItem(QtWidgets.QSpacerItem(10,20),1,7,1,1)  # Horizontal spacer
-        sigmaLabel = QtWidgets.QLabel('Highpass gSig:')  # QtWidgets.QCheckBox('Highpass')
-        self.layout.addWidget(sigmaLabel,1,8,1,1)
-        self.highpass = QtWidgets.QLineEdit()
-        self.highpass.setValidator(QtGui.QIntValidator(0,50))
-        self.highpass.setFixedWidth(30)
-        self.highpass.setAlignment(QtCore.Qt.AlignCenter)  # AlignRight
-        self.highpass.setText(str(self.sigma))
-        self.highpass.textChanged.connect(self.change_params)
-        self.layout.addWidget(self.highpass,1,9,1,1)
-        self.layout.addItem(QtWidgets.QSpacerItem(10,20),1,10,1,1)  # Horizontal spacer
-        medianLabel = QtWidgets.QLabel('Median filt:')
-        self.layout.addWidget(medianLabel,1,11,1,1)
-        self.medfilt = QtWidgets.QLineEdit()
-        self.medfilt.setValidator(QtGui.QIntValidator(0,50))
-        self.medfilt.setFixedWidth(30)
-        self.medfilt.setAlignment(QtCore.Qt.AlignCenter)  # AlignRight
-        self.medfilt.setText(str(self.medSize))
-        self.medfilt.textChanged.connect(self.change_params)
-        self.layout.addWidget(self.medfilt,1,12,1,1)
-        self.layout.addItem(QtWidgets.QSpacerItem(10,20),1,13,1,1)  # Horizontal spacer
-        cellLabel = QtWidgets.QLabel('Component:')
-        self.layout.addWidget(cellLabel,1,14,1,1)
-        self.component = QtWidgets.QLineEdit()
-        self.component.setValidator(QtGui.QIntValidator(-1,1000))
-        self.component.setFixedWidth(40)
-        self.component.setAlignment(QtCore.Qt.AlignCenter)  # AlignRight
-        self.component.setText(str(self.this_cell))
-        self.component.textChanged.connect(self.change_params)
-        self.layout.addWidget(self.component,1,15,1,1)
-        ## -------- Graphics displaying frames and shifts --------------------
+        self.layout.addWidget(self.rate, 1, 9, 1, 1)
+
+        # -------- Graphics --------
         graph = pg.GraphicsLayoutWidget()
         self.p1 = graph.addViewBox(row=0, col=0, lockAspect=True, invertY=True)
         self.img = pg.ImageItem()
-        self.contour = pg.IsocurveItem(level=32, pen='m')  # Level at which the isocurve is drawn. Note that img_components are normalized 0-255 
-        self.contour.setParentItem(self.img)  # Make sure isocurve is always correctly displayed over image
+        self.contour = pg.IsocurveItem(level=32, pen='m')
+        self.contour.setParentItem(self.img)
         self.contour.setZValue(10)
+        self.contour.setVisible(False)
         self.p1.addItem(self.img)
         self.p2 = graph.addPlot(row=1, col=0)
         self.p2.addLegend()
@@ -106,220 +155,300 @@ class MemapPlayer(QtWidgets.QMainWindow):
         self.vline.setValue(0)
         self.vline.sigPositionChanged.connect(self.go_to_frame)
         self.p2.addItem(self.vline, ignoreBounds=True)
-        graph.ci.layout.setRowStretchFactor(0,2)  # Stretch row 0 by the factor 2
-        self.layout.addWidget(graph,2,0,1,16)
-        ## -------- Get shift from parent cnmf object ------------------------
-        if hasattr(parent, 'cnmf'):  # Call from caiman_gui1p_lite
-            self.img_components = parent.img_components
-            self.C = parent.cnmf.estimates.C
-            if hasattr(parent.cnmf, 'shifts_rig'):
-                self.shifts = parent.cnmf.shifts_rig  # (y,x) shifts, shape (T,2)
-            self.plot_trace()
-            self.plot_contour()
-            
-        ## -------- Button play/pauss and slider -----------------------------
-        iconSize = QtCore.QSize(24,24)
+        graph.ci.layout.setRowStretchFactor(0, 2)
+        self.layout.addWidget(graph, 2, 0, 1, 16)
+
+        # -------- Parent data (contours, traces, background) --------
+        if parent is not None and hasattr(parent, 'cnmf'):
+            self.img_components = getattr(parent, 'img_components', None)
+            self.C = getattr(parent.cnmf, 'estimates', None)
+            if self.C is not None:
+                self.C = getattr(self.C, 'C', None)
+            self.shifts = getattr(parent.cnmf, 'shifts_rig', None)
+            self._estimates_b = getattr(parent.cnmf.estimates, 'b', None)
+            self._estimates_f = getattr(parent.cnmf.estimates, 'f', None)
+            if self.img_components is not None:
+                self.showContoursCheck.setEnabled(True)
+            if self.C is not None:
+                self.component.setMaximum(max(9999, self.C.shape[0] - 1))
+            if self._estimates_b is None or self._estimates_f is None:
+                idx = self.videoModeCombo.findText(self.VIDEO_BGSUB)
+                if idx >= 0:
+                    self.videoModeCombo.model().item(idx).setEnabled(False)
+        else:
+            self.img_components = None
+            self.C = None
+            self.shifts = None
+            self._estimates_b = None
+            self._estimates_f = None
+            self.showContoursCheck.setEnabled(False)
+
+        self.plot_trace()
+        self.plot_contour()
+
+        # -------- Playback --------
+        iconSize = QtCore.QSize(24, 24)
         self.playButton = QtWidgets.QToolButton()
         self.playButton.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay))
         self.playButton.setIconSize(iconSize)
-        self.playButton.setToolTip('Play')
         self.playButton.setCheckable(True)
         self.playButton.setEnabled(False)
         self.pauseButton = QtWidgets.QToolButton()
         self.pauseButton.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaPause))
         self.pauseButton.setIconSize(iconSize)
-        self.pauseButton.setToolTip('Pause')
         self.pauseButton.setCheckable(True)
         self.pauseButton.setEnabled(False)
         self.frameSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.frameSlider.setTracking(False)
-        self.layout.addWidget(self.playButton,3,0,1,1)
-        self.layout.addWidget(self.pauseButton,3,1,1,1)
-        self.layout.addWidget(self.frameSlider,3,2,1,14)
-        frameTitle = QtWidgets.QLabel('Elapsed time:')
+        self.layout.addWidget(self.playButton, 3, 0, 1, 1)
+        self.layout.addWidget(self.pauseButton, 3, 1, 1, 1)
+        self.layout.addWidget(self.frameSlider, 3, 2, 1, 12)
+        self.layout.addWidget(QtWidgets.QLabel('Time:'), 4, 0, 1, 1)
         self.elapsedTime = QtWidgets.QLabel('0:00.0')
-        self.layout.addWidget(frameTitle,4,0,1,2)
-        self.layout.addWidget(self.elapsedTime,4,2,1,1)        
+        self.layout.addWidget(self.elapsedTime, 4, 1, 1, 2)
         self.playButton.clicked.connect(self.play)
         self.pauseButton.clicked.connect(self.pause)
         self.frameSlider.valueChanged.connect(self.change_slider)
-        ## -------- Setup timer ----------------------------------------------
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.next_frame)
-    
-    # %%
-    def open_memap(self):
-        fd = os.path.expanduser('~/caiman_data/temp')
-        fmemap = QtWidgets.QFileDialog.getOpenFileName(
-            caption='Load memory-mapped file', filter='MMAP (*.mmap)', dir=fd)[0]
+
+        # Load first mmap from combo if we populated it from parent
+        if self.mmapCombo.count() > 0:
+            path = self.mmapCombo.itemData(0)
+            if path:
+                self._load_mmap_path(path)
+
+    def on_mmap_combo_changed(self):
+        idx = self.mmapCombo.currentIndex()
+        if idx < 0:
+            return
+        path = self.mmapCombo.itemData(idx)
+        if path:
+            self._load_mmap_path(path)
+
+    def _load_mmap_path(self, fmemap):
+        self._dff_baseline = None
         try:
-            Yr, dims, T = load_memmap(fmemap)  # Shape (N,T)
-            self.movie = Yr.T.reshape((T,)+dims, order='F')  # Shape (T,y,x)
-            self.nframe = T
-            self.fileLabel.setText('Loaded: '+fmemap)
+            self.Yr, self.dims, self.nframe = load_memmap(fmemap)
             self.loaded = True
+            self.fileLabel.setText('Loaded: ' + os.path.basename(fmemap))
         except Exception:
-            self.fileLabel.setText('Loading '+fmemap+' failed. Try other file...')
-        
+            self.loaded = False
+            self.fileLabel.setText('Load failed: ' + os.path.basename(fmemap))
+            self.Yr = None
+            self.nframe = 0
         if self.loaded:
+            self.saveVideoButton.setEnabled(True)
             self.playButton.setEnabled(True)
             self.frameSlider.setMinimum(0)
-            self.frameSlider.setMaximum(self.nframe-1)
-            
-    # %%
+            self.frameSlider.setMaximum(max(0, self.nframe - 1))
+            self.cframe = 0
+            self.vline.setValue(0)
+            self.frameSlider.setValue(0)
+            self.go_to_frame()
+
+    def open_memap(self):
+        fd = os.path.expanduser('~/caiman_data/temp')
+        if self._parent and getattr(self._parent, 'fname', None):
+            fd = os.path.dirname(self._parent.fname)
+        fmemap, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, 'Load memory-mapped file', fd, 'MMAP (*.mmap)')
+        if not fmemap:
+            return
+        # Add to combo if not already present
+        existing = [self.mmapCombo.itemData(i) for i in range(self.mmapCombo.count())]
+        if fmemap not in existing:
+            self.mmapCombo.addItem(os.path.basename(fmemap), fmemap)
+        self.mmapCombo.setCurrentIndex(self.mmapCombo.findData(fmemap))
+        self._load_mmap_path(fmemap)
+
+    def on_video_mode_changed(self, text):
+        self._video_mode = text
+        self._dff_baseline = None
+        if self.loaded:
+            self.go_to_frame()
+
+    def on_show_contours_changed(self):
+        show = self.showContoursCheck.isChecked()
+        self.contour.setVisible(show and self.this_cell >= 0)
+        self.plot_contour()
+
     def change_params(self):
-        if self.rate.text():  # Avoid empty string during editing
-            self.fps = float(self.rate.text())
-        if self.binning.text():
-            self.dt = int(self.binning.text())
-        if self.highpass.text():
-            self.sigma = int(self.highpass.text())
-        if self.medfilt.text():
-            self.medSize = int(self.medfilt.text())
-        if self.component.text():
-            self.this_cell = int(self.component.text())
-            if hasattr(self, 'img_components'):
-                self.plot_contour()
-            if hasattr(self, 'C'):
-                self.plot_trace()
-    
+        if self.rate.text():
+            try:
+                self.fps = float(self.rate.text())
+            except ValueError:
+                pass
+        self.this_cell = self.component.value()
+        self.contour.setVisible(self.showContoursCheck.isChecked() and self.this_cell >= 0)
+        self.plot_contour()
+        self.plot_trace()
+        if self.loaded and self.playButton.isEnabled():
+            self.go_to_frame()
+
     def change_slider(self):
-        if self.vline.value() != int(self.frameSlider.value()):  # Block signal
-            self.vline.setValue(int(self.frameSlider.value()))  # This will trigger self.go_to_frame()
-        
-    # %%    
+        if int(self.vline.value()) != self.frameSlider.value():
+            self.vline.setValue(self.frameSlider.value())
+
+    def _get_frame_raw(self, frame_idx):
+        """Return one frame (y, x) from mmap."""
+        if self.Yr is None:
+            return None
+        data = self.Yr[:, frame_idx]
+        return data.reshape(self.dims, order='F').astype(np.float32)
+
+    def _compute_dff_baseline(self):
+        if self._dff_baseline is not None:
+            return
+        # Percentile (8th) over time per pixel; use a sample if T is large
+        T = self.nframe
+        step = max(1, T // 500)
+        idx = np.arange(0, T, step)
+        frames = np.array([self._get_frame_raw(i) for i in idx])
+        if frames is None or len(frames) == 0:
+            self._dff_baseline = None
+            return
+        self._dff_baseline = np.percentile(frames, 8, axis=0).astype(np.float32)
+        self._dff_baseline[self._dff_baseline < 1e-6] = 1e-6
+
+    def _get_background_frame(self, t):
+        if self._estimates_b is None or self._estimates_f is None:
+            return None
+        b, f = self._estimates_b, self._estimates_f
+        if hasattr(b, 'toarray'):
+            b = b.toarray()
+        if b.ndim == 1:
+            bg = (b * f[:, t]).reshape(self.dims, order='F')
+        else:
+            bg = (b.dot(f[:, t])).reshape(self.dims, order='F')
+        return bg.astype(np.float32)
+
+    def _process_frame(self, frame_idx):
+        """Get one displayable frame and apply video mode (raw/dF/F/bg sub)."""
+        if not self.loaded or self.Yr is None:
+            return None
+        frame = self._get_frame_raw(frame_idx)
+        if frame is None:
+            return None
+        if self._video_mode == self.VIDEO_DFF:
+            self._compute_dff_baseline()
+            if self._dff_baseline is not None:
+                frame = (frame - self._dff_baseline) / self._dff_baseline
+        elif self._video_mode == self.VIDEO_BGSUB:
+            t = int(np.clip(frame_idx, 0, self.nframe - 1))
+            bg = self._get_background_frame(t)
+            if bg is not None:
+                frame = frame - bg
+        return frame
+
+    def _frame_to_display(self, frame):
+        """Stretch contrast and convert to uint8 for display."""
+        if frame is None:
+            return None
+        min_ = np.percentile(frame, self.prct[0]) if self.prct[0] > 0 else np.min(frame)
+        max_ = np.percentile(frame, self.prct[1]) if self.prct[1] < 100 else np.max(frame)
+        if max_ <= min_:
+            max_ = min_ + 1
+        out = np.clip(255 * (frame - min_) / (max_ - min_), 0, 255).astype(np.uint8)
+        return out
+
+    def next_frame(self):
+        self.cframe += 1
+        if self.cframe < self.nframe:
+            frame = self._process_frame(self.cframe)
+            if frame is not None:
+                frame = self._frame_to_display(frame)
+                self.img.setImage(frame)
+            self.vline.setValue(self.cframe)
+            self.frameSlider.setValue(self.cframe)
+            sec = self.cframe / self.fps
+            self.elapsedTime.setText(f'{int(sec) // 60}:{int(sec) % 60:02d}.{int((sec % 1) * 10)}')
+        else:
+            self.timer.stop()
+
+    def go_to_frame(self):
+        if not self.playButton.isEnabled():
+            return
+        self.cframe = int(np.clip(self.vline.value(), 0, self.nframe - 1))
+        self.frameSlider.setValue(self.cframe)
+        frame = self._process_frame(self.cframe)
+        if frame is not None:
+            frame = self._frame_to_display(frame)
+            self.img.setImage(frame)
+        sec = self.cframe / self.fps
+        self.elapsedTime.setText(f'{int(sec) // 60}:{int(sec) % 60:02d}.{int((sec % 1) * 10)}')
+
     def play(self):
-        if self.cframe < self.nframe-1:
+        if self.cframe < self.nframe - 1:
             self.playButton.setEnabled(False)
             self.pauseButton.setEnabled(True)
             self.frameSlider.setEnabled(False)
             self.timer.start(0)
-    
+
     def pause(self):
         self.timer.stop()
         self.playButton.setEnabled(True)
-        self.pauseButton.setEnabled(False)
+        self.pauseButton.setEnabled(True)
         self.frameSlider.setEnabled(True)
-    
-    def next_frame(self):
-        '''Read and display the next frame and adjust the current time window in the plot
-        '''
-        self.cframe += self.dt
-        if self.cframe < self.nframe:            
-            frame = self.movie[slice(self.cframe-self.dt, self.cframe),:,:].mean(axis=0).astype(np.float32)
-            if self.sigma > 0:
-                frame -= cv2.GaussianBlur(frame, (4*self.sigma+1,)*2,
-                                          sigmaX=self.sigma, sigmaY=self.sigma)
-            if self.medSize > 1:
-                frame = cv2.medianBlur(frame, self.medSize)
-            min_ = np.percentile(frame, self.prct[0]) if self.prct[0]>0 else np.min(frame)
-            max_ = np.percentile(frame, self.prct[1]) if self.prct[1]<100 else np.max(frame)
-            frame = np.clip(255*(frame-min_)/(max_-min_),0,255).astype(np.uint8)  # Fixed grayscale range    
-            self.img.setImage(frame)
-            self.vline.setValue(self.cframe)
-            self.frameSlider.setValue(self.cframe)
-            sec = self.cframe/self.fps  # Elapsed time in second
-            decisec = round((sec - np.floor(sec))*10)  # Decisecond
-            self.elapsedTime.setText(f'{int(sec)//60}:{int(sec)%60}.{decisec}')
-        else:
-            self.timer.stop()
-            
-    def go_to_frame(self):
-        '''Jump to the frame specified by the vertical line (during pause only)
-        '''
-        ## Do nothing during play (playButton is not enabled)
-        if self.playButton.isEnabled():
-            self.cframe = int(self.vline.value())  # int(self.frameSlider.value())
-            self.frameSlider.setValue(self.cframe)
-            frame = self.movie[self.cframe,:,:].astype(np.float32)
-            if self.sigma > 0:
-                frame -= cv2.GaussianBlur(frame, (4*self.sigma+1,)*2,
-                                          sigmaX=self.sigma, sigmaY=self.sigma)
-            if self.medSize > 1:
-                frame = cv2.medianBlur(frame, self.medSize)
-            min_ = np.percentile(frame, self.prct[0]) if self.prct[0]>0 else np.min(frame)
-            max_ = np.percentile(frame, self.prct[1]) if self.prct[1]<100 else np.max(frame)
-            frame = np.clip(255*(frame-min_)/(max_-min_),0,255).astype(np.uint8)  # Fixed grayscale range
-            self.img.setImage(frame)
-            sec = self.cframe/self.fps  # Elapsed time in second
-            decisec = round((sec - np.floor(sec))*10)  # Decisecond
-            self.elapsedTime.setText(f'{int(sec)//60}:{int(sec)%60}.{decisec}')
-    
+
     def keyPressEvent(self, event):
-        '''Override the existing method to activate left/right key to scroll through the frameSlider
-        '''
-        if self.playButton.isEnabled():  # During pause only
-            # if event.modifiers() !=  QtCore.Qt.ShiftModifier:
+        if self.playButton.isEnabled():
             if event.key() == QtCore.Qt.Key_Left:
-                self.cframe = np.clip(self.cframe-self.dframe,0,self.nframe-1)
+                self.cframe = np.clip(self.cframe - self.dframe, 0, self.nframe - 1)
                 self.frameSlider.setValue(self.cframe)
+                self.vline.setValue(self.cframe)
             elif event.key() == QtCore.Qt.Key_Right:
-                self.cframe = np.clip(self.cframe+self.dframe,0,self.nframe-1)
+                self.cframe = np.clip(self.cframe + self.dframe, 0, self.nframe - 1)
                 self.frameSlider.setValue(self.cframe)
-    
-    # %%
+                self.vline.setValue(self.cframe)
+
     def plot_trace(self):
         self.p2.clearPlots()
-        if hasattr(self, 'shifts'):
-            self.p2.plot(self.shifts[:,0], pen=(0,128,255), name='y shift')
-            self.p2.plot(self.shifts[:,1], pen=(102,204,0), name='x shift')
-        if self.this_cell >= 0:
-            fluor = self.C[self.this_cell]/np.max(self.C[self.this_cell])*10-10  # Downshifting to separate from motion traces
-            self.p2.plot(fluor, pen=(255,51,153), name='fluor')
-        
-    def plot_contour(self):
-        if self.this_cell >= 0:
-            self.contour.setData(self.img_components[self.this_cell].astype(np.float32))
-    
-# %%
-def load_memmap(fname, dtype='float32', key=None):
-    ''' 
-    Load a memory mapped file with customized data type.
-    
-    Parameters
-    ----------
-    fname: str
-        Full path of the file to be loaded
-    dtype: str
-        'float32' (default caiman) or 'uint16'
-    key: None or array-like (slice, range, ...)
-        Used to read only a subset of frame indices
-        
-    Returns:
-    -------
-    Yr:
-        Memory mapped variable, shape (N,T)
-    dims: tuple
-        Frame dimensions
-    T: int
-        Number of frames
-    '''
-    filename = os.path.splitext(os.path.split(fname)[-1])[0]
-    fpart = filename.split('_')
-    d1, d2, d3, T, order = int(fpart[-9]), int(fpart[-7]), int(fpart[-5]), int(fpart[-1]), fpart[-3]
-    dims = (d1,d2) if d3==1 else (d1,d2,d3)
-    shape_mov = (np.uint64(np.prod(dims)), np.uint64(T))
-    byte = int(os.path.getsize(fname)/np.prod(dims)/T)
-    if byte == 2 and dtype == 'float32':
-        dtype = 'uint16'
-    elif byte == 4 and dtype == 'uint16':
-        dtype = 'float32'
-    if key is None:
-        Yr = np.memmap(fname, mode='r', shape=shape_mov, order=order, dtype=dtype)
-    else:
-        Yr = np.memmap(fname, mode='r', shape=shape_mov, order=order, dtype=dtype)[:,key]
-        T = Yr.shape[1]
-    return Yr, dims, T
+        if hasattr(self, 'shifts') and self.shifts is not None:
+            self.p2.plot(self.shifts[:, 0], pen=(0, 128, 255), name='y shift')
+            self.p2.plot(self.shifts[:, 1], pen=(102, 204, 0), name='x shift')
+        if self.this_cell >= 0 and self.C is not None:
+            fluor = self.C[self.this_cell] / (np.max(self.C[self.this_cell]) + 1e-12) * 10 - 10
+            self.p2.plot(fluor, pen=(255, 51, 153), name='fluor')
 
-# %% Call memap_window(self) from the parent GUI
+    def plot_contour(self):
+        if self.this_cell >= 0 and self.img_components is not None:
+            self.contour.setData(self.img_components[self.this_cell].astype(np.float32))
+            self.contour.setVisible(self.showContoursCheck.isChecked())
+        else:
+            self.contour.setVisible(False)
+
+    def save_as_video(self):
+        if not self.loaded or self.Yr is None:
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, 'Save video', '', 'AVI (*.avi);;MP4 (*.mp4)')
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        fourcc = cv2.VideoWriter_fourcc(*'XVID') if ext == '.avi' else cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(path, fourcc, self.fps, (self.dims[1], self.dims[0]), False)
+        if not out.isOpened():
+            self.fileLabel.setText('Could not create video file')
+            return
+        self.fileLabel.setText('Writing video...')
+        QtWidgets.QApplication.processEvents()
+        for t in range(self.nframe):
+            frame = self._process_frame(t)
+            if frame is not None:
+                disp = self._frame_to_display(frame)
+                out.write(cv2.cvtColor(disp, cv2.COLOR_GRAY2BGR))
+        out.release()
+        self.fileLabel.setText('Saved: ' + os.path.basename(path))
+
+
 def memap_window(parent):
     win = MemapPlayer(parent)
     win.show()
-    
-# %% Execute MemapPlayer() as a standalone GUI
+
+
 if __name__ == '__main__':
     app = QtWidgets.QApplication(sys.argv)
     win = MemapPlayer()
     win.show()
     sys.exit(app.exec())
-    
