@@ -19,7 +19,7 @@ caiman
 
 ### Using the GUI
 <p align="center" width=100%>
-  <img src="images/GUI_mode_neurons.png" width="90%">
+  <img src="images/GUI_main.png" width="90%">
 </p>
 
 CaimanGUI is mainly designed for visualizing CaImAn processed one-photon imaging data (should also work for two-photon data). The implemented functionalities are partly inspired by the widely used [Suite2p](https://github.com/MouseLand/suite2p) software for two-photon data.

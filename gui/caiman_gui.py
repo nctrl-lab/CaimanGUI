@@ -41,7 +41,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, datapath=None, jsonpath=None):
         super(MainWindow, self).__init__()
         self.resize(1400,1000)
-        self.setWindowTitle('Caiman GUI Lite for 1-photon data')
+        self.setWindowTitle('Caiman GUI')
 
         try:
             with importlib.resources.as_file(

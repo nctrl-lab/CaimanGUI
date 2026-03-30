@@ -20,7 +20,7 @@ caiman
 ## 화면 구성
 
 <p align="center" width=100%>
-  <img src="images/GUI_mode_neurons.png" width="90%">
+  <img src="images/GUI_main.png" width="90%">
 </p>
 
 - **왼쪽 상단** — FOV (neuron 위치)
@@ -83,6 +83,10 @@ caiman
 모든 low 임계값 통과(AND) + high 임계값 하나 이상 통과(OR) → Quality "Good".
 
 ## Pipeline 실행 (`Ctrl+R`)
+
+<p align="center" width=100%>
+  <img src="images/GUI_runner.png" width="90%">
+</p>
 
 1. 데이터 폴더 선택 (AVI/TIFF)
 2. Pipeline 유형 선택 — 1p (CNMF-E) / 2p (CNMF)
