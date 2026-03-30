@@ -70,6 +70,17 @@ The GUI supports several viewing modes:
 - **accepted**: Display accepted components with keyboard navigation
 - **neighbors**: Display neighbor correlation of accepted components
 
+### CaImAn Runner (Ctrl+R)
+<p align="center" width=100%>
+  <img src="images/GUI_runner.png" width="90%">
+</p>
+
+Run the full CaImAn processing pipeline from the GUI:
+1. Select data folder (AVI/TIFF)
+2. Choose pipeline type — 1p (CNMF-E) or 2p (CNMF)
+3. Adjust parameters
+4. Preview → Run
+
 ### Motion-corrected movie
 <p align="center" width=100%>
   <img src="images/GUI_memap_player.png" width="60%">
