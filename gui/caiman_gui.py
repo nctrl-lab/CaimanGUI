@@ -301,6 +301,10 @@ class MainWindow(QtWidgets.QMainWindow):
             
         try:
             self.cnmf = load_CNMF(self.fname)
+            # Support files saved with estimates.Cn (notebook convention)
+            if not hasattr(self.cnmf, 'cn_filter') or self.cnmf.cn_filter is None:
+                if hasattr(self.cnmf.estimates, 'Cn') and self.cnmf.estimates.Cn is not None:
+                    self.cnmf.cn_filter = self.cnmf.estimates.Cn
             self.loaded = True
             self.statusBar().showMessage('Loading '+self.fname)
         except Exception:
@@ -320,8 +324,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cms = np.array([center_of_mass(comp) for comp in img_components])  # Shape (K,2) centroid (y,x) of each component
             self.img_components = np.stack(
                 [normalize_image(comp) for comp in img_components], axis=0)
-            # Store a background image (initially PNR image)
-            self.image = normalize_image(self.cnmf.pnr, stretch_prct=True, rgb=True)
+            # Store a background image (PNR if available, else correlation image)
+            if hasattr(self.cnmf, 'pnr') and self.cnmf.pnr is not None:
+                self.image = normalize_image(self.cnmf.pnr, stretch_prct=True, rgb=True)
+            elif hasattr(self.cnmf, 'cn_filter') and self.cnmf.cn_filter is not None:
+                self.image = normalize_image(self.cnmf.cn_filter, stretch_prct=True, rgb=True)
+            else:
+                self.image = normalize_image(np.mean(np.stack(img_components), axis=0), stretch_prct=True, rgb=True)
 
             # Precompute normalized A, C, Cres for movie display
             # Use .toarray() to avoid issues with sparse matrices for A
@@ -344,7 +353,7 @@ class MainWindow(QtWidgets.QMainWindow):
             estimates.Cres_norm = Cres / Cres_peak
 
             corr_matrix = np.corrcoef(estimates.C + estimates.YrA)
-            np.fill_diagonal(corr_matrix, np.NaN)
+            np.fill_diagonal(corr_matrix, np.nan)
             self.corr_matrix = corr_matrix
             rval = estimates.r_values
             self.metric = (rval - rval.min())/(rval.max() - rval.min())
@@ -966,7 +975,7 @@ class MainWindow(QtWidgets.QMainWindow):
             
     def change_image(self):
         img_to_plot = self.par1.param('Image').value()
-        if img_to_plot=='PNR':
+        if img_to_plot=='PNR' and hasattr(self.cnmf, 'pnr') and self.cnmf.pnr is not None:
             self.image = normalize_image(self.cnmf.pnr, stretch_prct=True, rgb=True)
             self.disable_video_controls()
             self.draw_fov_overall()
@@ -1426,7 +1435,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 [self.img_components[keep,:,:], normalize_image(img_merged)[np.newaxis,:,:]], axis=0)
             self.cms = np.vstack([self.cms[keep,:], np.array(center_of_mass(img_merged))])
             self.corr_matrix = np.corrcoef(self.cnmf.estimates.C)
-            np.fill_diagonal(self.corr_matrix, np.NaN)
+            np.fill_diagonal(self.corr_matrix, np.nan)
             self.cnmf.estimates.accepted_list = update_list(K, self.cnmf.estimates.accepted_list, self.selected_cells)
             self.cnmf.estimates.rejected_list = update_list(K, self.cnmf.estimates.rejected_list, self.selected_cells)
             if hasattr(self.cnmf.estimates, 'uncertain_list'):
